@@ -96,6 +96,23 @@ class CoreTest(unittest.TestCase):
                 appmod.LEGACY_DATA_DIR = old_legacy
                 appmod.THUMBS_DIR, appmod.ALERTS_DIR = old_thumbs, old_alerts
 
+    def test_entry_click_keeps_cursor_at_end(self):
+        root = appmod.Tk()
+        try:
+            app = object.__new__(appmod.App)
+            value = appmod.StringVar(value="250")
+            entry = appmod.App.make_entry(app, root, value)
+            entry.pack()
+            root.update()
+            entry.event_generate("<ButtonPress-1>", x=2, y=2)
+            entry.event_generate("<ButtonRelease-1>", x=2, y=2)
+            root.update()
+            root.after(80, root.quit)
+            root.mainloop()
+            self.assertEqual(entry.index("insert"), 3)
+        finally:
+            root.destroy()
+
     def test_prune_alerts_keeps_newest(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
