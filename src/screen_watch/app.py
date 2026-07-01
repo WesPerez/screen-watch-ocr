@@ -61,23 +61,11 @@ DWM_TNP_OPACITY = 0x4
 DWM_TNP_VISIBLE = 0x8
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
-WS_EX_LAYERED = 0x00080000
-WS_EX_TRANSPARENT = 0x00000020
-WS_EX_NOACTIVATE = 0x08000000
-WS_CHILD = 0x40000000
-WS_VISIBLE = 0x10000000
-LWA_ALPHA = 0x00000002
-MW_FILTERMODE_EXCLUDE = 0
-SWP_NOSIZE = 0x0001
-SWP_NOMOVE = 0x0002
-SWP_NOZORDER = 0x0004
-SWP_NOACTIVATE = 0x0010
-SWP_FRAMECHANGED = 0x0020
 PREVIEW_W = 260
 PREVIEW_H = 150
-SCREEN_PREVIEW_SECONDS = 0.05
+SCREEN_PREVIEW_SECONDS = 0.016
 MIN_SCAN_INTERVAL_MS = 120
-SOURCE_PREVIEW_SYNC_MS = 50
+SOURCE_PREVIEW_SYNC_MS = 16
 
 
 def enable_dpi_awareness():
@@ -143,12 +131,7 @@ class DwmThumbnailProperties(ctypes.Structure):
     ]
 
 
-class MagTransform(ctypes.Structure):
-    _fields_ = [("v", ctypes.c_float * 9)]
-
-
 _WINAPI_READY = False
-_MAG_READY = False
 
 
 def configure_winapi():
@@ -173,35 +156,10 @@ def configure_winapi():
     user32.GetWindow.restype = wintypes.HWND
     user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
     user32.GetWindowLongW.restype = wintypes.LONG
-    user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
-    user32.SetWindowLongW.restype = wintypes.LONG
-    user32.SetLayeredWindowAttributes.argtypes = [wintypes.HWND, wintypes.COLORREF, ctypes.c_ubyte, wintypes.DWORD]
-    user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
     user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     user32.GetClassNameW.restype = ctypes.c_int
-    user32.CreateWindowExW.argtypes = [
-        wintypes.DWORD,
-        wintypes.LPCWSTR,
-        wintypes.LPCWSTR,
-        wintypes.DWORD,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        ctypes.c_int,
-        wintypes.HWND,
-        wintypes.HMENU,
-        wintypes.HINSTANCE,
-        wintypes.LPVOID,
-    ]
-    user32.CreateWindowExW.restype = wintypes.HWND
-    user32.DestroyWindow.argtypes = [wintypes.HWND]
-    user32.DestroyWindow.restype = wintypes.BOOL
-    user32.MoveWindow.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.BOOL]
-    user32.MoveWindow.restype = wintypes.BOOL
-    user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
-    user32.SetWindowPos.restype = wintypes.BOOL
     user32.GetWindowDC.argtypes = [wintypes.HWND]
     user32.GetWindowDC.restype = wintypes.HDC
     user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
@@ -234,27 +192,6 @@ def configure_winapi():
     except Exception:
         pass
     _WINAPI_READY = True
-
-
-def configure_magnifier():
-    global _MAG_READY
-    if _MAG_READY or os.name != "nt":
-        return _MAG_READY
-    configure_winapi()
-    try:
-        mag = ctypes.windll.Magnification
-        mag.MagInitialize.restype = wintypes.BOOL
-        mag.MagUninitialize.restype = wintypes.BOOL
-        mag.MagSetWindowSource.argtypes = [wintypes.HWND, wintypes.RECT]
-        mag.MagSetWindowSource.restype = wintypes.BOOL
-        mag.MagSetWindowTransform.argtypes = [wintypes.HWND, ctypes.POINTER(MagTransform)]
-        mag.MagSetWindowTransform.restype = wintypes.BOOL
-        mag.MagSetWindowFilterList.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_int, ctypes.POINTER(wintypes.HWND)]
-        mag.MagSetWindowFilterList.restype = wintypes.BOOL
-        _MAG_READY = bool(mag.MagInitialize())
-    except Exception:
-        _MAG_READY = False
-    return _MAG_READY
 
 
 def startup_dir():
@@ -706,20 +643,23 @@ def dwm_unregister(thumb):
         pass
 
 
-def dwm_update(thumb, width, height):
+def dwm_update(thumb, x, y, width, height, visible=True):
     try:
+        props = DwmThumbnailProperties()
+        props.dwFlags = DWM_TNP_VISIBLE | DWM_TNP_OPACITY
+        props.opacity = 255
+        props.fVisible = bool(visible)
+        if not visible:
+            return ctypes.windll.dwmapi.DwmUpdateThumbnailProperties(thumb, ctypes.byref(props)) == 0
         src = Size()
         ctypes.windll.dwmapi.DwmQueryThumbnailSourceSize(thumb, ctypes.byref(src))
         src_w, src_h = max(1, src.cx), max(1, src.cy)
         scale = min(width / src_w, height / src_h)
         dst_w, dst_h = max(1, int(src_w * scale)), max(1, int(src_h * scale))
-        x = (width - dst_w) // 2
-        y = (height - dst_h) // 2
-        props = DwmThumbnailProperties()
-        props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY
-        props.rcDestination = wintypes.RECT(x, y, x + dst_w, y + dst_h)
-        props.opacity = 255
-        props.fVisible = True
+        left = int(x + (width - dst_w) // 2)
+        top = int(y + (height - dst_h) // 2)
+        props.dwFlags |= DWM_TNP_RECTDESTINATION
+        props.rcDestination = wintypes.RECT(left, top, left + dst_w, top + dst_h)
         return ctypes.windll.dwmapi.DwmUpdateThumbnailProperties(thumb, ctypes.byref(props)) == 0
     except Exception:
         return False
@@ -733,81 +673,6 @@ def hwnd_for_tk(window):
             return int(window.winfo_id())
         except Exception:
             return 0
-
-
-def set_preview_window_style(hwnd, layered=False):
-    try:
-        user32 = ctypes.windll.user32
-        style = user32.GetWindowLongW(int(hwnd), GWL_EXSTYLE)
-        style |= WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
-        if layered:
-            style |= WS_EX_LAYERED
-        user32.SetWindowLongW(int(hwnd), GWL_EXSTYLE, style)
-        if layered:
-            user32.SetLayeredWindowAttributes(int(hwnd), 0, 255, LWA_ALPHA)
-        user32.SetWindowPos(int(hwnd), None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
-    except Exception:
-        pass
-
-
-def mag_create(host_hwnd):
-    if not configure_magnifier():
-        return None
-    try:
-        hwnd = ctypes.windll.user32.CreateWindowExW(
-            0,
-            "Magnifier",
-            "ScreenWatchPreview",
-            WS_CHILD | WS_VISIBLE,
-            0,
-            0,
-            PREVIEW_W,
-            PREVIEW_H,
-            int(host_hwnd),
-            None,
-            None,
-            None,
-        )
-        return int(hwnd) or None
-    except Exception:
-        return None
-
-
-def mag_destroy(hwnd):
-    try:
-        if hwnd:
-            ctypes.windll.user32.DestroyWindow(int(hwnd))
-    except Exception:
-        pass
-
-
-def mag_update(hwnd, source, width, height, excluded_hwnds=None):
-    try:
-        ctypes.windll.user32.MoveWindow(int(hwnd), 0, 0, int(width), int(height), True)
-        if excluded_hwnds:
-            excluded = [int(item) for item in excluded_hwnds if item]
-            if excluded:
-                handles = (wintypes.HWND * len(excluded))(*excluded)
-                ctypes.windll.Magnification.MagSetWindowFilterList(int(hwnd), MW_FILTERMODE_EXCLUDE, len(excluded), handles)
-        src_w = max(1, int(source.get("width", width)))
-        src_h = max(1, int(source.get("height", height)))
-        scale = min(width / src_w, height / src_h)
-        transform = MagTransform()
-        for i in range(9):
-            transform.v[i] = 0
-        transform.v[0] = float(scale)
-        transform.v[4] = float(scale)
-        transform.v[8] = 1
-        rect = wintypes.RECT(
-            int(source.get("_abs_left", source.get("left", 0))),
-            int(source.get("_abs_top", source.get("top", 0))),
-            int(source.get("_abs_left", source.get("left", 0))) + src_w,
-            int(source.get("_abs_top", source.get("top", 0))) + src_h,
-        )
-        mag = ctypes.windll.Magnification
-        return bool(mag.MagSetWindowTransform(int(hwnd), ctypes.byref(transform)) and mag.MagSetWindowSource(int(hwnd), rect))
-    except Exception:
-        return False
 
 
 def beep_wave(volume, milliseconds=180, frequency=1200, sample_rate=22050):
@@ -875,7 +740,6 @@ class App:
         self.window_refresh_job = None
         self.source_widgets = {}
         self.dwm_thumbs = {}
-        self.mag_previews = {}
         self.preview_sources = []
         self.preview_frames = {}
         self.preview_lock = threading.Lock()
@@ -1298,14 +1162,13 @@ class App:
             for app in self.selected_apps:
                 item = self.window_info.get(self.app_key(app))
                 name = item["display"] if item else window_display(app["title"], app.get("ordinal", 1), app.get("ordinal", 1) > 1)
-                sources.append({"key": f"app:{self.app_key(app)}", "kind": "window", "name": name, "source": item, "available": bool(item)})
+                sources.append({"key": f"app:{self.app_key(app)}", "kind": "window", "name": name, "source": item, "available": bool(item), "dwm": bool(item and os.name == "nt")})
             source_keys = {item["key"] for item in sources}
             with self.preview_lock:
                 self.preview_sources = [dict(item) for item in sources]
             for key in list(self.source_widgets):
                 if key not in source_keys:
                     self.unregister_dwm_preview(key)
-                    self.unregister_mag_preview(key)
                     self.source_widgets[key]["frame"].destroy()
                     del self.source_widgets[key]
                     with self.preview_lock:
@@ -1334,16 +1197,10 @@ class App:
                     self.source_widgets[key] = {"frame": outer, "area": area, "image": image_label, "name": name_label}
                     widgets = self.source_widgets[key]
                 if source.get("dwm") and self.sync_dwm_preview(key, widgets["area"], source["source"]["hwnd"]):
-                    self.unregister_mag_preview(key)
-                    widgets["image"].place_forget()
-                    widgets["image"].image = None
-                elif source.get("mag") and self.sync_mag_preview(key, widgets["area"], source["source"]):
-                    self.unregister_dwm_preview(key)
                     widgets["image"].place_forget()
                     widgets["image"].image = None
                 else:
                     self.unregister_dwm_preview(key)
-                    self.unregister_mag_preview(key)
                     widgets["image"].place(x=0, y=0, width=PREVIEW_W, height=PREVIEW_H)
                     with self.preview_lock:
                         frame = self.preview_frames.get(key)
@@ -1363,19 +1220,6 @@ class App:
         record = self.dwm_thumbs.pop(key, None)
         if record:
             dwm_unregister(record["thumb"])
-            try:
-                record["window"].destroy()
-            except TclError:
-                pass
-
-    def unregister_mag_preview(self, key):
-        record = self.mag_previews.pop(key, None)
-        if record:
-            mag_destroy(record.get("hwnd"))
-            try:
-                record["window"].destroy()
-            except TclError:
-                pass
 
     def visible_preview_rect(self, widget):
         if self.root.state() in {"withdrawn", "iconic"} or not widget.winfo_viewable():
@@ -1396,89 +1240,24 @@ class App:
         record = self.dwm_thumbs.get(key)
         if rect is None:
             if record:
-                record["window"].withdraw()
+                dwm_update(record["thumb"], 0, 0, 1, 1, visible=False)
                 record["rect"] = None
             return True
         x, y, width, height = rect
-        if not record or record.get("hwnd") != hwnd:
+        root_hwnd = hwnd_for_tk(self.root)
+        rel = (x - self.root.winfo_rootx(), y - self.root.winfo_rooty(), width, height)
+        if not record or record.get("hwnd") != hwnd or record.get("root") != root_hwnd:
             self.unregister_dwm_preview(key)
-            window = Toplevel(self.root)
-            window.withdraw()
-            window.overrideredirect(True)
-            window.transient(self.root)
-            window.configure(bg="#141414")
-            try:
-                window.wm_attributes("-toolwindow", True)
-            except TclError:
-                pass
-            window.update_idletasks()
-            dest = hwnd_for_tk(window)
-            set_preview_window_style(dest)
-            thumb = dwm_register(dest, hwnd)
+            thumb = dwm_register(root_hwnd, hwnd)
             if not thumb:
-                window.destroy()
                 return False
-            self.dwm_thumbs[key] = {"thumb": thumb, "hwnd": hwnd, "window": window, "rect": None}
+            self.dwm_thumbs[key] = {"thumb": thumb, "hwnd": hwnd, "root": root_hwnd, "rect": None}
             record = self.dwm_thumbs[key]
         try:
-            window = record["window"]
-            if record.get("rect") != rect:
-                window.geometry(f"{width}x{height}+{x}+{y}")
-                window.deiconify()
-                window.lift(self.root)
-                record["rect"] = rect
-            window.update_idletasks()
-            return dwm_update(record["thumb"], width, height)
-        except Exception:
-            return False
-
-    def sync_mag_preview(self, key, widget, source):
-        rect = self.visible_preview_rect(widget)
-        record = self.mag_previews.get(key)
-        if rect is None:
-            if record:
-                record["window"].withdraw()
-                record["rect"] = None
-            return True
-        x, y, width, height = rect
-        if not record:
-            window = Toplevel(self.root)
-            window.withdraw()
-            window.overrideredirect(True)
-            window.transient(self.root)
-            window.configure(bg="#141414")
-            try:
-                window.wm_attributes("-toolwindow", True)
-            except TclError:
-                pass
-            window.update_idletasks()
-            host = hwnd_for_tk(window)
-            set_preview_window_style(host, layered=True)
-            hwnd = mag_create(host)
-            if not hwnd:
-                window.destroy()
-                return False
-            self.mag_previews[key] = {"window": window, "hwnd": hwnd, "host": host, "rect": None, "source": None}
-            record = self.mag_previews[key]
-        try:
-            window = record["window"]
-            source_rect = (
-                int(source.get("_abs_left", source.get("left", 0))),
-                int(source.get("_abs_top", source.get("top", 0))),
-                int(source.get("width", width)),
-                int(source.get("height", height)),
-            )
-            changed = record.get("rect") != rect or record.get("source") != source_rect
-            if changed:
-                window.geometry(f"{width}x{height}+{x}+{y}")
-                window.deiconify()
-                window.lift(self.root)
-                window.update_idletasks()
-                root_hwnd = hwnd_for_tk(self.root)
-                ok = mag_update(record["hwnd"], source, width, height, [root_hwnd, record.get("host")])
+            if record.get("rect") != rel:
+                ok = dwm_update(record["thumb"], rel[0], rel[1], rel[2], rel[3], visible=True)
                 if ok:
-                    record["rect"] = rect
-                    record["source"] = source_rect
+                    record["rect"] = rel
                 return ok
             return True
         except Exception:
@@ -1678,8 +1457,6 @@ class App:
         self.close_event.set()
         for key in list(self.dwm_thumbs):
             self.unregister_dwm_preview(key)
-        for key in list(self.mag_previews):
-            self.unregister_mag_preview(key)
         if self.tray_icon:
             self.tray_icon.stop()
             self.tray_icon = None
