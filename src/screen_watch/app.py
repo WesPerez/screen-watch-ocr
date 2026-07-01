@@ -1,14 +1,18 @@
 import argparse
 import ctypes
+import io
 import json
+import math
 import os
 import queue
 import re
 import shutil
 import subprocess
+import struct
 import sys
 import threading
 import time
+import wave
 from pathlib import Path
 from tkinter import BooleanVar, Canvas, DoubleVar, Frame, IntVar, Label, PanedWindow, StringVar, Tk, Toplevel, filedialog, messagebox, ttk
 from tkinter import TclError
@@ -50,6 +54,7 @@ DIB_RGB_COLORS = 0
 PW_RENDERFULLCONTENT = 0x00000002
 GW_OWNER = 4
 GWL_EXSTYLE = -20
+DWMWA_EXTENDED_FRAME_BOUNDS = 9
 DWMWA_CLOAKED = 14
 DWM_TNP_RECTDESTINATION = 0x1
 DWM_TNP_OPACITY = 0x4
@@ -70,9 +75,26 @@ SWP_NOACTIVATE = 0x0010
 SWP_FRAMECHANGED = 0x0020
 PREVIEW_W = 260
 PREVIEW_H = 150
-SCREEN_PREVIEW_SECONDS = 0.5
+SCREEN_PREVIEW_SECONDS = 0.05
 MIN_SCAN_INTERVAL_MS = 120
-NATIVE_PREVIEW_SYNC_MS = 250
+SOURCE_PREVIEW_SYNC_MS = 50
+
+
+def enable_dpi_awareness():
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+enable_dpi_awareness()
 
 
 class BitmapInfoHeader(ctypes.Structure):
@@ -370,6 +392,10 @@ def parse_positive_float(value, name):
     return number
 
 
+def parse_volume(value):
+    return max(0, min(100, int(value)))
+
+
 def load_json(path, default):
     try:
         return json.loads(Path(path).read_text(encoding="utf-8"))
@@ -384,7 +410,7 @@ def write_json(path, data):
 
 
 def template_stamp():
-    return time.strftime("%Y%m%d%H%M%S") + f"{time.time_ns() % 1_000_000_000:09d}"
+    return time.strftime("%Y%m%d%H%M%S")
 
 
 def template_name(profile, count, stamp=None):
@@ -417,6 +443,24 @@ def ensure_thumb(target):
         target = dict(target)
         target["thumb"] = str(save_thumb(Image.open(path), path))
     return target
+
+
+def delete_target_files(target):
+    removed = 0
+    for key, parent in (("path", DATA_DIR / "templates"), ("thumb", THUMBS_DIR)):
+        path = target.get(key)
+        if path and is_under(path, parent):
+            try:
+                Path(path).unlink(missing_ok=True)
+                removed += 1
+            except TypeError:
+                p = Path(path)
+                if p.exists():
+                    p.unlink()
+                    removed += 1
+            except OSError:
+                pass
+    return removed
 
 
 def prune_alerts(path, max_count):
@@ -533,13 +577,16 @@ def window_rect(hwnd):
     configure_winapi()
     user32 = ctypes.windll.user32
     rect = wintypes.RECT()
-    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-        return None
     if user32.IsIconic(hwnd):
         placement = WindowPlacement()
         placement.length = ctypes.sizeof(WindowPlacement)
         if user32.GetWindowPlacement(hwnd, ctypes.byref(placement)):
             rect = placement.rcNormalPosition
+        elif not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+    elif ctypes.windll.dwmapi.DwmGetWindowAttribute(int(hwnd), DWMWA_EXTENDED_FRAME_BOUNDS, ctypes.byref(rect), ctypes.sizeof(rect)) != 0:
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
     width, height = rect.right - rect.left, rect.bottom - rect.top
     if width < 2 or height < 2:
         return None
@@ -595,6 +642,27 @@ def mostly_black(frame):
     return frame is None or float(np.mean(frame)) < 8
 
 
+def black_fraction(frame, threshold=8):
+    if frame is None:
+        return 1.0
+    return float(np.mean(np.max(frame, axis=2) < threshold))
+
+
+def crop_black_padding(frame, threshold=8):
+    if frame is None or black_fraction(frame, threshold) < 0.25:
+        return frame
+    mask = np.max(frame, axis=2) >= threshold
+    if not np.any(mask):
+        return frame
+    rows, cols = np.where(mask)
+    top, bottom = int(rows.min()), int(rows.max()) + 1
+    left, right = int(cols.min()), int(cols.max()) + 1
+    height, width = frame.shape[:2]
+    if left <= width * 0.05 and top <= height * 0.05 and right >= width * 0.35 and bottom >= height * 0.35 and (right < width * 0.9 or bottom < height * 0.9):
+        return frame[top:bottom, left:right].copy()
+    return frame
+
+
 def capture_window_visible(sct, hwnd):
     info = window_rect(hwnd)
     if not info:
@@ -607,9 +675,14 @@ def capture_window_visible(sct, hwnd):
 def capture_window_frame(sct, hwnd):
     frame = capture_window(hwnd)
     if not mostly_black(frame):
+        frame = crop_black_padding(frame)
+    if not mostly_black(frame) and black_fraction(frame) < 0.25:
         return frame
     visible = capture_window_visible(sct, hwnd)
-    return visible if visible is not None else frame
+    if visible is not None and not mostly_black(visible):
+        if frame is None or mostly_black(frame) or black_fraction(visible) + 0.1 < black_fraction(frame):
+            return visible
+    return frame if frame is not None else visible
 
 
 def dwm_register(dest_hwnd, source_hwnd):
@@ -737,14 +810,34 @@ def mag_update(hwnd, source, width, height, excluded_hwnds=None):
         return False
 
 
-def beep_for(seconds):
+def beep_wave(volume, milliseconds=180, frequency=1200, sample_rate=22050):
+    volume = parse_volume(volume)
+    frames = int(sample_rate * milliseconds / 1000)
+    amplitude = int(32767 * (volume / 100))
+    raw = bytearray()
+    for i in range(frames):
+        sample = int(amplitude * math.sin(2 * math.pi * frequency * i / sample_rate))
+        raw.extend(struct.pack("<h", sample))
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(raw)
+    return out.getvalue()
+
+
+def beep_for(seconds, volume=100):
     try:
         import winsound
 
         deadline = time.time() + float(seconds)
         while time.time() < deadline:
-            winsound.Beep(1200, 180)
-            time.sleep(0.02)
+            level = parse_volume(volume() if callable(volume) else volume)
+            if level:
+                winsound.PlaySound(beep_wave(level), winsound.SND_MEMORY | winsound.SND_SYNC)
+            else:
+                time.sleep(0.18)
     except Exception:
         pass
 
@@ -801,6 +894,9 @@ class App:
         self.interval_ms = IntVar(value=250)
         self.cooldown = DoubleVar(value=1.0)
         self.beep_seconds = DoubleVar(value=3.0)
+        self.beep_volume = IntVar(value=100)
+        self.beep_volume_level = 100
+        self.beep_volume.trace_add("write", lambda *_args: self.update_beep_volume())
         self.max_templates = IntVar(value=100)
         self.max_alerts = IntVar(value=int(self.state.get("max_alerts", 50)))
         self.beep = BooleanVar(value=True)
@@ -823,8 +919,10 @@ class App:
         threading.Thread(target=self.run_preview_worker, daemon=True).start()
         self.root.after(250, self.restore_layout)
         self.root.after(1000, self.refresh_windows_loop)
-        self.root.after(120, self.refresh_source_previews)
+        self.root.after(SOURCE_PREVIEW_SYNC_MS, self.refresh_source_previews)
         self.root.after(100, self.poll_events)
+        if self.root.state() != "withdrawn":
+            self.ensure_tray_icon(show_errors=False)
 
     def _build(self):
         self.main_pane = PanedWindow(self.root, orient="horizontal", sashwidth=8, sashrelief="raised", bd=0)
@@ -881,15 +979,21 @@ class App:
 
         gallery_box = ttk.LabelFrame(self.left_pane, text="匹配图片")
         self.left_pane.add(gallery_box, minsize=170)
+        gallery_bar = ttk.Frame(gallery_box)
+        gallery_bar.pack(fill="x", padx=4, pady=(4, 0))
+        self.target_select_btn = ttk.Button(gallery_bar, text="全选", width=8, command=self.toggle_all_targets)
+        self.target_select_btn.pack(side="right")
         self.target_canvas = Canvas(gallery_box, highlightthickness=0, height=260)
         self.target_canvas.pack(side="left", fill="both", expand=True)
         scroll = ttk.Scrollbar(gallery_box, orient="vertical", command=self.target_canvas.yview)
         scroll.pack(side="right", fill="y")
         self.target_canvas.configure(yscrollcommand=scroll.set)
         self.target_canvas.bind("<Button-1>", lambda _event: self.target_canvas.focus_set())
+        self.target_canvas.bind("<MouseWheel>", self.scroll_targets)
         self.gallery_inner = ttk.Frame(self.target_canvas)
         self.gallery_window = self.target_canvas.create_window((0, 0), window=self.gallery_inner, anchor="nw")
         self.gallery_inner.bind("<Configure>", lambda _event: self.target_canvas.configure(scrollregion=self.target_canvas.bbox("all")))
+        self.gallery_inner.bind("<MouseWheel>", self.scroll_targets)
         self.target_canvas.bind("<Configure>", lambda event: self.target_canvas.itemconfigure(self.gallery_window, width=event.width))
 
         log_box = ttk.LabelFrame(self.left_pane, text="报警与扫描日志")
@@ -926,7 +1030,7 @@ class App:
 
         match_box = ttk.LabelFrame(right, text="匹配")
         match_box.pack(fill="x")
-        for label, var in [("阈值", self.threshold), ("缩放", self.scales), ("间隔ms", self.interval_ms), ("同图冷却秒", self.cooldown), ("蜂鸣秒", self.beep_seconds), ("模板最多张", self.max_templates), ("截图最多张", self.max_alerts)]:
+        for label, var in [("阈值", self.threshold), ("缩放", self.scales), ("间隔ms", self.interval_ms), ("同图冷却秒", self.cooldown), ("蜂鸣秒", self.beep_seconds), ("蜂鸣音量", self.beep_volume), ("模板最多张", self.max_templates), ("截图最多张", self.max_alerts)]:
             row = ttk.Frame(match_box)
             row.pack(fill="x", padx=8, pady=3)
             ttk.Label(row, text=label, width=12).pack(side="left")
@@ -969,6 +1073,13 @@ class App:
 
     def make_check(self, parent, var, label, command=None):
         return ttk.Checkbutton(parent, text=label, variable=var, command=command)
+
+    def update_beep_volume(self):
+        self.beep_volume_level = parse_volume(self.beep_volume.get())
+
+    def scroll_targets(self, event):
+        self.target_canvas.yview_scroll(int(-event.delta / 120), "units")
+        return "break"
 
     def refresh_monitors(self):
         selected = {i for i, var in self.monitor_vars.items() if var.get()}
@@ -1103,17 +1214,7 @@ class App:
         removed = self.targets[: len(self.targets) - keep_count]
         self.targets = self.targets[-keep_count:] if keep_count else []
         for target in removed:
-            for key, parent in (("path", DATA_DIR / "templates"), ("thumb", THUMBS_DIR)):
-                path = target.get(key)
-                if path and is_under(path, parent):
-                    try:
-                        Path(path).unlink(missing_ok=True)
-                    except TypeError:
-                        p = Path(path)
-                        if p.exists():
-                            p.unlink()
-                    except OSError:
-                        pass
+            delete_target_files(target)
         return len(removed)
 
     def make_thumb(self, target):
@@ -1136,16 +1237,31 @@ class App:
     def toggle_target(self, index, var):
         self.targets[index]["enabled"] = bool(var.get())
         self.save_current_profile()
+        self.update_target_select_button()
         self.status.set(f"当前 {len(self.targets)} 张模板，启用 {len(self.enabled_targets())} 张。")
+
+    def update_target_select_button(self):
+        if hasattr(self, "target_select_btn"):
+            all_selected = bool(self.targets) and all(t.get("enabled", True) for t in self.targets)
+            self.target_select_btn.configure(text="反选" if all_selected else "全选")
+
+    def toggle_all_targets(self):
+        selected = bool(self.targets) and all(t.get("enabled", True) for t in self.targets)
+        for target in self.targets:
+            target["enabled"] = not selected
+        self.reload_target_list()
+        self.save_current_profile()
 
     def remove_selected(self):
         if self.selected_target is not None and self.selected_target < len(self.targets):
-            self.targets.pop(self.selected_target)
+            delete_target_files(self.targets.pop(self.selected_target))
             self.selected_target = None
         self.reload_target_list()
         self.save_current_profile()
 
     def clear_targets(self):
+        for target in self.targets:
+            delete_target_files(target)
         self.targets.clear()
         self.selected_target = None
         self.reload_target_list()
@@ -1178,11 +1294,11 @@ class App:
         try:
             sources = []
             for monitor in self.selected_regions():
-                sources.append({"key": f"screen:{monitor['name']}", "kind": "screen", "name": monitor["name"], "source": self.preview_screen_source(monitor), "available": True, "mag": os.name == "nt"})
+                sources.append({"key": f"screen:{monitor['name']}", "kind": "screen", "name": monitor["name"], "source": self.preview_screen_source(monitor), "available": True})
             for app in self.selected_apps:
                 item = self.window_info.get(self.app_key(app))
                 name = item["display"] if item else window_display(app["title"], app.get("ordinal", 1), app.get("ordinal", 1) > 1)
-                sources.append({"key": f"app:{self.app_key(app)}", "kind": "window", "name": name, "source": item, "available": bool(item), "dwm": bool(item and os.name == "nt")})
+                sources.append({"key": f"app:{self.app_key(app)}", "kind": "window", "name": name, "source": item, "available": bool(item)})
             source_keys = {item["key"] for item in sources}
             with self.preview_lock:
                 self.preview_sources = [dict(item) for item in sources]
@@ -1239,7 +1355,7 @@ class App:
             pass
         finally:
             try:
-                self.preview_job = self.root.after(NATIVE_PREVIEW_SYNC_MS, self.refresh_source_previews)
+                self.preview_job = self.root.after(SOURCE_PREVIEW_SYNC_MS, self.refresh_source_previews)
             except TclError:
                 pass
 
@@ -1379,10 +1495,6 @@ class App:
                     for source in sources:
                         if self.close_event.is_set():
                             return
-                        if source.get("dwm") or source.get("mag"):
-                            continue
-                        if source["kind"] == "screen" and source["key"] in self.preview_frames:
-                            continue
                         frame = self.capture_preview_frame(sct, source)
                         if frame is not None:
                             with self.preview_lock:
@@ -1440,7 +1552,8 @@ class App:
             card.grid_propagate(False)
             enabled_var = BooleanVar(value=target.get("enabled", True))
             self.target_vars.append(enabled_var)
-            ttk.Checkbutton(card, variable=enabled_var, text="匹配", command=lambda i=idx, v=enabled_var: self.toggle_target(i, v)).pack(anchor="w", padx=4, pady=(3, 0))
+            check = ttk.Checkbutton(card, variable=enabled_var, text="匹配", command=lambda i=idx, v=enabled_var: self.toggle_target(i, v))
+            check.pack(anchor="w", padx=4, pady=(3, 0))
             thumb = self.make_thumb(target)
             self.thumb_refs.append(thumb)
             image = Label(card, image=thumb, bg=card["bg"], width=self.thumb_w, height=self.thumb_h)
@@ -1449,7 +1562,10 @@ class App:
             text.pack(fill="x", padx=4)
             for widget in (card, image, text):
                 widget.bind("<Button-1>", lambda _event, i=idx: self.select_target(i))
+            for widget in (card, check, image, text):
+                widget.bind("<MouseWheel>", self.scroll_targets)
         self.target_canvas.configure(height=max(180, int((self.thumb_h + 54) * 2)))
+        self.update_target_select_button()
         self.status.set(f"当前 {len(self.targets)} 张模板，启用 {len(self.enabled_targets())} 张。")
 
     def enabled_targets(self):
@@ -1512,6 +1628,7 @@ class App:
                 "cooldown": self.cooldown.get(),
                 "beep": self.beep.get(),
                 "beep_seconds": self.beep_seconds.get(),
+                "beep_volume": self.beep_volume.get(),
                 "max_templates": self.max_templates.get(),
             },
         }
@@ -1535,6 +1652,8 @@ class App:
         self.cooldown.set(match.get("cooldown", 1.0))
         self.beep.set(match.get("beep", True))
         self.beep_seconds.set(match.get("beep_seconds", match.get("beep_count", 3)))
+        self.beep_volume.set(match.get("beep_volume", 100))
+        self.update_beep_volume()
         self.max_templates.set(match.get("max_templates", 100))
         selected_monitors = set(data.get("monitors", []))
         if selected_monitors:
@@ -1576,14 +1695,19 @@ class App:
 
     def hide_to_tray(self):
         self.root.withdraw()
+        self.ensure_tray_icon(show_errors=True)
+        self.status.set("已缩小到系统托盘。")
+
+    def ensure_tray_icon(self, show_errors=False):
         if self.tray_icon:
-            return
+            return True
         try:
             import pystray
         except Exception as exc:
-            messagebox.showerror("托盘不可用", f"缺少托盘组件：{exc}")
-            self.root.deiconify()
-            return
+            if show_errors:
+                messagebox.showerror("托盘不可用", f"缺少托盘组件：{exc}")
+                self.root.deiconify()
+            return False
 
         def show(_icon=None, _item=None):
             self.root.after(0, self.show_window)
@@ -1593,12 +1717,10 @@ class App:
 
         self.tray_icon = pystray.Icon(APP_NAME, self.tray_image(), "屏幕监控OCR", pystray.Menu(pystray.MenuItem("打开", show, default=True), pystray.MenuItem("退出", exit_)))
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
-        self.status.set("已缩小到系统托盘。")
+        return True
 
     def show_window(self):
-        if self.tray_icon:
-            self.tray_icon.stop()
-            self.tray_icon = None
+        self.ensure_tray_icon(show_errors=False)
         self.root.deiconify()
         self.root.lift()
 
@@ -1671,6 +1793,9 @@ class App:
         threshold = float(self.threshold.get())
         scales = parse_scales(self.scales.get())
         beep_seconds = parse_positive_float(self.beep_seconds.get(), "beep_seconds")
+        beep_volume = parse_volume(self.beep_volume.get())
+        if beep_volume != int(self.beep_volume.get()):
+            self.beep_volume.set(beep_volume)
         parse_positive_int(self.max_templates.get(), "max_templates")
         max_alerts = parse_positive_int(self.max_alerts.get(), "max_alerts")
         interval_ms = scan_interval_ms(self.interval_ms.get())
@@ -1687,7 +1812,7 @@ class App:
             ],
             "cooldown_seconds": float(self.cooldown.get()),
             "poll_interval_seconds": interval_ms / 1000,
-            "alarm": {"beep": bool(self.beep.get()), "beep_seconds": beep_seconds, "save_dir": "screenshots", "jsonl": "alerts.jsonl", "max_alerts": max_alerts},
+            "alarm": {"beep": bool(self.beep.get()), "beep_seconds": beep_seconds, "beep_volume": beep_volume, "save_dir": "screenshots", "jsonl": "alerts.jsonl", "max_alerts": max_alerts},
         }
 
     def start(self):
@@ -1804,7 +1929,7 @@ class App:
             if now < self.beep_until:
                 return
             self.beep_until = now + float(seconds)
-        threading.Thread(target=beep_for, args=(seconds,), daemon=True).start()
+        threading.Thread(target=beep_for, args=(seconds, lambda: self.beep_volume_level), daemon=True).start()
 
     def poll_events(self):
         while True:
