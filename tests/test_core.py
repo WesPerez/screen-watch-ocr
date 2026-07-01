@@ -5,7 +5,7 @@ from pathlib import Path
 from PIL import Image
 
 import screen_watch.app as appmod
-from screen_watch.app import parse_positive_float, parse_positive_int, parse_scales, prune_alerts, template_name
+from screen_watch.app import app_from_legacy, parse_positive_float, parse_positive_int, parse_scales, prune_alerts, template_name, window_key
 from screen_watch.core import self_test
 
 
@@ -30,6 +30,11 @@ class CoreTest(unittest.TestCase):
 
     def test_template_name_uses_profile_count_date(self):
         self.assertEqual(template_name(1, 11, "20260701"), "1-11-20260701")
+
+    def test_window_selection_keys_and_legacy_profile(self):
+        self.assertEqual(window_key("Demo", 2), "Demo" + "\0" + "2")
+        self.assertEqual(app_from_legacy("Demo"), {"title": "Demo", "ordinal": 1})
+        self.assertEqual(app_from_legacy({"title": "Demo", "ordinal": 2}), {"title": "Demo", "ordinal": 2})
 
     def test_profile_roundtrip(self):
         old_data, old_profiles, old_state = appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH
@@ -161,8 +166,8 @@ class CoreTest(unittest.TestCase):
                 root.withdraw()
                 app = appmod.App(root)
                 app.monitor_vars = {1: appmod.BooleanVar(value=False)}
-                app.window_info = {123: {"title": "Demo", "hwnd": 123, "width": 200, "height": 100}}
-                app.window_vars = {123: appmod.BooleanVar(value=True)}
+                app.window_info = {window_key("Demo", 1): {"title": "Demo", "display": "Demo", "hwnd": 123, "width": 200, "height": 100, "key": window_key("Demo", 1)}}
+                app.selected_apps = [{"title": "Demo", "ordinal": 1}]
                 one = appmod.DATA_DIR / "templates" / "one.png"
                 one.parent.mkdir(parents=True, exist_ok=True)
                 Image.new("RGB", (12, 10), "red").save(one)
@@ -170,6 +175,11 @@ class CoreTest(unittest.TestCase):
                 config = app.detector_config()
                 self.assertEqual(config["regions"], [])
                 self.assertEqual(config["windows"][0]["title"], "Demo")
+                self.assertEqual(config["window_apps"], [{"title": "Demo", "ordinal": 1}])
+                app.window_info = {}
+                config = app.detector_config()
+                self.assertEqual(config["windows"], [])
+                self.assertEqual(config["window_apps"], [{"title": "Demo", "ordinal": 1}])
                 root.destroy()
             finally:
                 appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH = old_data, old_profiles, old_state

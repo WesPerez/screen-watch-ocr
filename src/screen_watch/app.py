@@ -48,6 +48,11 @@ MAX_WINDOW_ROWS = 30
 SRCCOPY = 0x00CC0020
 DIB_RGB_COLORS = 0
 PW_RENDERFULLCONTENT = 0x00000002
+GW_OWNER = 4
+GWL_EXSTYLE = -20
+DWMWA_CLOAKED = 14
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_APPWINDOW = 0x00040000
 
 
 class BitmapInfoHeader(ctypes.Structure):
@@ -102,6 +107,14 @@ def configure_winapi():
     user32.IsIconic.restype = wintypes.BOOL
     user32.IsWindowVisible.argtypes = [wintypes.HWND]
     user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+    user32.GetWindow.restype = wintypes.HWND
+    user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowLongW.restype = wintypes.LONG
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
     user32.GetWindowDC.argtypes = [wintypes.HWND]
     user32.GetWindowDC.restype = wintypes.HDC
     user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
@@ -119,6 +132,12 @@ def configure_winapi():
     gdi32.GetDIBits.restype = ctypes.c_int
     gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
     gdi32.DeleteDC.argtypes = [wintypes.HDC]
+    try:
+        dwmapi = ctypes.windll.dwmapi
+        dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD]
+        dwmapi.DwmGetWindowAttribute.restype = ctypes.HRESULT
+    except Exception:
+        pass
     _WINAPI_READY = True
 
 
@@ -322,6 +341,38 @@ def read_clipboard_images():
     return images
 
 
+def window_key(title, ordinal=1):
+    return f"{title}\0{int(ordinal)}"
+
+
+def window_display(title, ordinal=1, duplicate=False):
+    return f"{title} #{ordinal}" if duplicate else title
+
+
+def app_from_legacy(value):
+    if isinstance(value, dict):
+        return {"title": value.get("title", ""), "ordinal": int(value.get("ordinal", 1) or 1)}
+    return {"title": str(value), "ordinal": 1}
+
+
+def window_is_cloaked(hwnd):
+    try:
+        cloaked = ctypes.c_int(0)
+        result = ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+        return result == 0 and bool(cloaked.value)
+    except Exception:
+        return False
+
+
+def window_class(hwnd):
+    try:
+        buf = ctypes.create_unicode_buffer(256)
+        ctypes.windll.user32.GetClassNameW(hwnd, buf, len(buf))
+        return buf.value
+    except Exception:
+        return ""
+
+
 def list_app_windows():
     if os.name != "nt":
         return []
@@ -333,6 +384,18 @@ def list_app_windows():
     def enum_proc(hwnd, _lparam):
         if not user32.IsWindowVisible(hwnd):
             return True
+        ex_style = int(user32.GetWindowLongW(hwnd, GWL_EXSTYLE))
+        owner = user32.GetWindow(hwnd, GW_OWNER)
+        if owner and not (ex_style & WS_EX_APPWINDOW):
+            return True
+        if ex_style & WS_EX_TOOLWINDOW:
+            return True
+        if window_is_cloaked(hwnd):
+            return True
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value == os.getpid():
+            return True
         length = user32.GetWindowTextLengthW(hwnd)
         if length <= 0:
             return True
@@ -340,6 +403,8 @@ def list_app_windows():
         user32.GetWindowTextW(hwnd, title, length + 1)
         text = title.value.strip()
         if not text or text in {APP_NAME, "Screen Watch OCR", "Program Manager"}:
+            return True
+        if window_class(hwnd) in {"Windows.UI.Core.CoreWindow", "ApplicationFrameInputSinkWindow"}:
             return True
         rect = wintypes.RECT()
         if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
@@ -353,7 +418,12 @@ def list_app_windows():
     user32.EnumWindows(enum_proc, 0)
     seen = set()
     out = []
-    for item in windows:
+    counts = {}
+    for item in sorted(windows, key=lambda x: (x["title"].lower(), x["hwnd"])):
+        counts[item["title"]] = counts.get(item["title"], 0) + 1
+        item["ordinal"] = counts[item["title"]]
+        item["key"] = window_key(item["title"], item["ordinal"])
+        item["display"] = window_display(item["title"], item["ordinal"], sum(1 for w in windows if w["title"] == item["title"]) > 1)
         key = (item["hwnd"], item["title"])
         if key not in seen:
             seen.add(key)
@@ -460,10 +530,12 @@ class App:
         self.resize_job = None
         self.layout_restore_job = None
         self.monitor_vars = {}
-        self.window_vars = {}
         self.window_info = {}
-        self.saved_window_titles = []
-        self.source_refs = []
+        self.window_choices = []
+        self.selected_apps = []
+        self.window_choice = StringVar(value="选择应用...")
+        self.window_refresh_job = None
+        self.source_widgets = {}
         self.preview_job = None
         self.worker = None
         self.tray_icon = None
@@ -498,14 +570,16 @@ class App:
         self.root.bind("<Configure>", self.on_resize)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(250, self.restore_layout)
-        self.root.after(1000, self.refresh_source_previews)
+        self.root.after(1000, self.refresh_windows_loop)
+        self.root.after(120, self.refresh_source_previews)
         self.root.after(100, self.poll_events)
 
     def _build(self):
         self.main_pane = PanedWindow(self.root, orient="horizontal", sashwidth=8, sashrelief="raised", bd=0)
         self.main_pane.pack(fill="both", expand=True, padx=12, pady=12)
         left = ttk.Frame(self.main_pane)
-        right_outer = ttk.Frame(self.main_pane, width=330)
+        right_outer = ttk.Frame(self.main_pane, width=300)
+        preview_outer = ttk.Frame(self.main_pane, width=300)
         right_canvas = Canvas(right_outer, highlightthickness=0)
         right_scroll = ttk.Scrollbar(right_outer, orient="vertical", command=right_canvas.yview)
         right_canvas.configure(yscrollcommand=right_scroll.set)
@@ -517,7 +591,21 @@ class App:
         right_canvas.bind("<Configure>", lambda event: right_canvas.itemconfigure(right_window, width=event.width))
         self.main_pane.add(left, minsize=360)
         self.main_pane.add(right_outer, minsize=260)
+        self.main_pane.add(preview_outer, minsize=260)
         self.main_pane.bind("<ButtonRelease-1>", lambda _event: self.capture_layout_ratios())
+
+        preview_box = ttk.LabelFrame(preview_outer, text="来源预览")
+        preview_box.pack(fill="both", expand=True)
+        self.source_canvas = Canvas(preview_box, highlightthickness=0)
+        source_scroll = ttk.Scrollbar(preview_box, orient="vertical", command=self.source_canvas.yview)
+        self.source_canvas.configure(yscrollcommand=source_scroll.set)
+        self.source_canvas.pack(side="left", fill="both", expand=True)
+        source_scroll.pack(side="right", fill="y")
+        self.source_frame = ttk.Frame(self.source_canvas)
+        self.source_window = self.source_canvas.create_window((0, 0), window=self.source_frame, anchor="nw")
+        self.source_frame.bind("<Configure>", lambda _event: self.source_canvas.configure(scrollregion=self.source_canvas.bbox("all")))
+        self.source_canvas.bind("<Configure>", lambda event: self.source_canvas.itemconfigure(self.source_window, width=event.width))
+        self.source_canvas.bind("<MouseWheel>", lambda event: self.source_canvas.yview_scroll(int(-event.delta / 120), "units"))
 
         profile_bar = ttk.Frame(left)
         profile_bar.pack(fill="x", pady=(0, 8))
@@ -569,21 +657,12 @@ class App:
 
         app_box = ttk.LabelFrame(right, text="监控应用")
         app_box.pack(fill="x", pady=(10, 0))
-        self.window_canvas = Canvas(app_box, highlightthickness=0, height=118)
-        window_scroll = ttk.Scrollbar(app_box, orient="vertical", command=self.window_canvas.yview)
-        self.window_canvas.configure(yscrollcommand=window_scroll.set)
-        self.window_canvas.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
-        window_scroll.pack(side="right", fill="y", pady=8)
-        self.window_inner = ttk.Frame(self.window_canvas)
-        self.window_canvas_window = self.window_canvas.create_window((0, 0), window=self.window_inner, anchor="nw")
-        self.window_inner.bind("<Configure>", lambda _event: self.window_canvas.configure(scrollregion=self.window_canvas.bbox("all")))
-        self.window_canvas.bind("<Configure>", lambda event: self.window_canvas.itemconfigure(self.window_canvas_window, width=event.width))
-        ttk.Button(app_box, text="刷新应用", command=self.refresh_windows).pack(fill="x", padx=8, pady=(0, 8))
-
-        source_box = ttk.LabelFrame(right, text="已选来源")
-        source_box.pack(fill="x", pady=(10, 0))
-        self.source_frame = ttk.Frame(source_box)
-        self.source_frame.pack(fill="x", padx=8, pady=8)
+        self.window_combo = ttk.Combobox(app_box, textvariable=self.window_choice, state="readonly", values=[], height=24)
+        self.window_combo.pack(fill="x", padx=8, pady=(8, 6))
+        self.window_combo.bind("<<ComboboxSelected>>", self.toggle_window_choice)
+        self.window_combo.bind("<Button-1>", lambda _event: self.refresh_windows())
+        self.selected_app_frame = ttk.Frame(app_box)
+        self.selected_app_frame.pack(fill="x", padx=8, pady=(0, 8))
 
         region_box = ttk.LabelFrame(right, text="区域")
         region_box.pack(fill="x", pady=10)
@@ -604,23 +683,24 @@ class App:
 
         actions = ttk.LabelFrame(right, text="运行")
         actions.pack(fill="x", pady=10)
-        self.start_btn = ttk.Button(actions, text="开始监控", command=self.start)
+        self.start_btn = ttk.Button(actions, text="开始监控", command=self.toggle_monitoring)
         self.start_btn.pack(fill="x", padx=8, pady=(8, 4))
         ttk.Button(actions, text="扫描一次", command=self.scan_once).pack(fill="x", padx=8, pady=4)
-        ttk.Button(actions, text="停止", command=self.stop).pack(fill="x", padx=8, pady=4)
         ttk.Button(actions, text="打开证据目录", command=self.open_evidence).pack(fill="x", padx=8, pady=(4, 8))
 
         ttk.Label(right, textvariable=self.status, wraplength=300).pack(fill="x", pady=8)
 
     def make_entry(self, parent, var):
         entry = ttk.Entry(parent, textvariable=var)
-        entry.bind("<FocusIn>", lambda event: event.widget.after_idle(event.widget.icursor, "end"))
+        entry.bind("<FocusIn>", self.focus_entry_end)
         entry.bind("<Button-1>", self.focus_entry_end)
+        entry.bind("<ButtonRelease-1>", self.focus_entry_end)
         return entry
 
     def focus_entry_end(self, event):
         event.widget.focus_set()
-        event.widget.after_idle(event.widget.icursor, "end")
+        event.widget.icursor("end")
+        event.widget.after(1, event.widget.icursor, "end")
         return "break"
 
     def make_check(self, parent, var, label, command=None):
@@ -640,22 +720,66 @@ class App:
         self.status.set(f"检测到 {len(monitors)} 个物理屏。")
 
     def refresh_windows(self):
-        selected_titles = {info["title"] for hwnd, info in self.window_info.items() if self.window_vars.get(hwnd) and self.window_vars[hwnd].get()}
-        selected_titles.update(self.saved_window_titles)
-        for child in self.window_inner.winfo_children():
+        self.window_choices = list_app_windows()
+        self.window_info = {item["key"]: item for item in self.window_choices}
+        selected = {self.app_key(app) for app in self.selected_apps}
+        values = [("✓ " if item["key"] in selected else "") + item["display"] for item in self.window_choices]
+        self.window_combo.configure(values=values)
+        self.window_choice.set("选择应用...")
+        self.reload_selected_apps()
+        if self.window_choices:
+            self.status.set(f"检测到 {len(self.window_choices)} 个可选择应用窗口。")
+
+    def refresh_windows_loop(self):
+        self.refresh_windows()
+        self.window_refresh_job = self.root.after(2000, self.refresh_windows_loop)
+
+    def app_key(self, app):
+        return window_key(app.get("title", ""), app.get("ordinal", 1))
+
+    def add_selected_app(self, item):
+        app = {"title": item["title"], "ordinal": item.get("ordinal", 1)}
+        if self.app_key(app) not in {self.app_key(x) for x in self.selected_apps}:
+            self.selected_apps.append(app)
+        self.reload_selected_apps()
+        self.refresh_windows()
+        self.save_current_profile()
+
+    def remove_selected_app(self, app):
+        key = self.app_key(app)
+        self.selected_apps = [item for item in self.selected_apps if self.app_key(item) != key]
+        self.reload_selected_apps()
+        self.refresh_windows()
+        self.save_current_profile()
+
+    def toggle_window_choice(self, _event=None):
+        value = self.window_choice.get()
+        index = next((i for i, item in enumerate(self.window_choices) if value == item["display"] or value == "✓ " + item["display"]), None)
+        if index is None:
+            self.window_choice.set("选择应用...")
+            return
+        item = self.window_choices[index]
+        key = item["key"]
+        selected = {self.app_key(app) for app in self.selected_apps}
+        if key in selected:
+            self.remove_selected_app({"title": item["title"], "ordinal": item["ordinal"]})
+        else:
+            self.add_selected_app(item)
+        self.window_choice.set("选择应用...")
+
+    def reload_selected_apps(self):
+        for child in self.selected_app_frame.winfo_children():
             child.destroy()
-        self.window_vars.clear()
-        self.window_info.clear()
-        windows = list_app_windows()
-        for item in windows:
-            hwnd = item["hwnd"]
-            self.window_info[hwnd] = item
-            var = BooleanVar(value=item["title"] in selected_titles)
-            self.window_vars[hwnd] = var
-            text = f"{item['title']} ({item['width']}x{item['height']})"
-            self.make_check(self.window_inner, var, text).pack(anchor="w", pady=2)
-        if windows:
-            self.status.set(f"检测到 {len(windows)} 个可选择应用窗口。")
+        if not self.selected_apps:
+            ttk.Label(self.selected_app_frame, text="未选择应用").pack(anchor="w")
+            return
+        for app in self.selected_apps:
+            row = ttk.Frame(self.selected_app_frame)
+            row.pack(fill="x", pady=2)
+            info = self.window_info.get(self.app_key(app))
+            title = info["display"] if info else window_display(app["title"], app.get("ordinal", 1), app.get("ordinal", 1) > 1)
+            ttk.Button(row, text="×", width=3, command=lambda a=app: self.remove_selected_app(a)).pack(side="left")
+            ttk.Label(row, text=title).pack(side="left", padx=4)
 
     def handle_paste_hotkey(self, _event=None):
         widget = self.root.focus_get()
@@ -764,35 +888,53 @@ class App:
 
     def selected_windows(self):
         out = []
-        for hwnd, var in self.window_vars.items():
-            if var.get() and hwnd in self.window_info:
-                title = self.window_info[hwnd]["title"]
-                out.append({"name": f"app-{safe_name(title)}", "title": title, "hwnd": hwnd})
+        for app in self.selected_apps:
+            item = self.window_info.get(self.app_key(app))
+            if item:
+                out.append({"name": f"app-{safe_name(item['display'])}", "title": item["title"], "display": item["display"], "hwnd": item["hwnd"], "key": item["key"]})
         return out
 
     def refresh_source_previews(self):
         try:
-            for child in self.source_frame.winfo_children():
-                child.destroy()
-            self.source_refs.clear()
-            sources = []
+            sources = {}
             for monitor in self.selected_regions():
-                sources.append(("screen", monitor["name"], monitor))
-            for window in self.selected_windows():
-                sources.append(("window", window["title"], window))
-            if not sources:
-                ttk.Label(self.source_frame, text="未选择来源").pack(anchor="w")
-            for idx, (kind, name, source) in enumerate(sources[:8]):
+                sources[f"screen:{monitor['name']}"] = ("screen", monitor["name"], monitor, True)
+            for app in self.selected_apps:
+                item = self.window_info.get(self.app_key(app))
+                name = item["display"] if item else window_display(app["title"], app.get("ordinal", 1), app.get("ordinal", 1) > 1)
+                sources[f"app:{self.app_key(app)}"] = ("window", name, item, bool(item))
+            for key in list(self.source_widgets):
+                if key not in sources:
+                    self.source_widgets[key]["frame"].destroy()
+                    del self.source_widgets[key]
+            if not sources and "empty" not in self.source_widgets:
                 frame = ttk.Frame(self.source_frame)
-                frame.grid(row=idx // 2, column=idx % 2, sticky="nw", padx=3, pady=3)
-                image = self.preview_image(kind, source)
-                if image:
-                    self.source_refs.append(image)
-                    Label(frame, image=image).pack()
-                ttk.Label(frame, text=name, width=16).pack()
+                frame.pack(fill="x", padx=6, pady=6)
+                ttk.Label(frame, text="未选择来源").pack(anchor="w")
+                self.source_widgets["empty"] = {"frame": frame}
+            elif sources and "empty" in self.source_widgets:
+                self.source_widgets["empty"]["frame"].destroy()
+                del self.source_widgets["empty"]
+            for key, (kind, name, source, available) in sources.items():
+                widgets = self.source_widgets.get(key)
+                if not widgets:
+                    outer = ttk.Frame(self.source_frame)
+                    outer.pack(fill="x", padx=6, pady=6)
+                    image_label = Label(outer)
+                    image_label.pack(fill="x")
+                    name_label = ttk.Label(outer, wraplength=260)
+                    name_label.pack(anchor="w", pady=(2, 0))
+                    self.source_widgets[key] = {"frame": outer, "image": image_label, "name": name_label}
+                    widgets = self.source_widgets[key]
+                photo = self.preview_image(kind, source) if available else self.placeholder_image("未启动")
+                widgets["image"].configure(image=photo)
+                widgets["image"].image = photo
+                widgets["name"].configure(text=name if available else f"{name}（未启动）")
+        except Exception:
+            pass
         finally:
             try:
-                self.preview_job = self.root.after(1200, self.refresh_source_previews)
+                self.preview_job = self.root.after(120, self.refresh_source_previews)
             except TclError:
                 pass
 
@@ -810,12 +952,18 @@ class App:
             if frame is None:
                 return None
             img = Image.fromarray(frame).convert("RGB")
-            img.thumbnail((120, 70))
-            canvas = Image.new("RGB", (120, 70), (245, 245, 245))
-            canvas.paste(img, ((120 - img.width) // 2, (70 - img.height) // 2))
+            width, height = 260, 150
+            img.thumbnail((width, height))
+            canvas = Image.new("RGB", (width, height), (245, 245, 245))
+            canvas.paste(img, ((width - img.width) // 2, (height - img.height) // 2))
             return ImageTk.PhotoImage(canvas)
         except Exception:
-            return None
+            return self.placeholder_image("无画面")
+
+    def placeholder_image(self, text):
+        width, height = 260, 150
+        canvas = Image.new("RGB", (width, height), (20, 20, 20))
+        return ImageTk.PhotoImage(canvas)
 
     def reload_target_list(self):
         for child in self.gallery_inner.winfo_children():
@@ -901,7 +1049,7 @@ class App:
         data = {
             "targets": self.targets,
             "monitors": [i for i, var in self.monitor_vars.items() if var.get()],
-            "windows": [item["title"] for item in self.selected_windows()],
+            "windows": self.selected_apps,
             "region": {"left": self.left.get(), "top": self.top.get(), "width": self.width.get(), "height": self.height.get()},
             "match": {
                 "threshold": self.threshold.get(),
@@ -938,10 +1086,10 @@ class App:
         if selected_monitors:
             for i, var in self.monitor_vars.items():
                 var.set(i in selected_monitors)
-        self.saved_window_titles = list(data.get("windows", []))
-        if self.saved_window_titles:
-            self.refresh_windows()
+        self.selected_apps = [app_from_legacy(item) for item in data.get("windows", []) if app_from_legacy(item).get("title")]
+        self.refresh_windows()
         self.loading_profile = False
+        self.reload_selected_apps()
         self.reload_target_list()
         self.status.set(f"已载入配置 {number}。")
 
@@ -961,9 +1109,10 @@ class App:
 
     def tray_image(self):
         img = Image.new("RGB", (64, 64), "#1573d1")
+        fill = (48, 180, 82) if self.is_monitoring() else (255, 255, 255)
         for x in range(14, 50):
             for y in range(20, 44):
-                img.putpixel((x, y), (255, 255, 255))
+                img.putpixel((x, y), fill)
         return img
 
     def hide_to_tray(self):
@@ -983,7 +1132,7 @@ class App:
         def exit_(_icon=None, _item=None):
             self.root.after(0, self.exit_app)
 
-        self.tray_icon = pystray.Icon(APP_NAME, self.tray_image(), "屏幕监控OCR", pystray.Menu(pystray.MenuItem("打开", show), pystray.MenuItem("退出", exit_)))
+        self.tray_icon = pystray.Icon(APP_NAME, self.tray_image(), "屏幕监控OCR", pystray.Menu(pystray.MenuItem("打开", show, default=True), pystray.MenuItem("退出", exit_)))
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
         self.status.set("已缩小到系统托盘。")
 
@@ -993,6 +1142,17 @@ class App:
             self.tray_icon = None
         self.root.deiconify()
         self.root.lift()
+
+    def update_tray_icon(self):
+        if self.tray_icon:
+            self.tray_icon.icon = self.tray_image()
+
+    def is_monitoring(self):
+        return bool(self.worker and self.worker.is_alive() and not self.stop_event.is_set())
+
+    def update_monitor_button(self):
+        self.start_btn.configure(text="停止监控" if self.is_monitoring() else "开始监控")
+        self.update_tray_icon()
 
     def toggle_startup(self):
         wanted = self.startup_enabled.get()
@@ -1047,7 +1207,7 @@ class App:
             raise ValueError("至少勾选一张要匹配的模板图片")
         regions = self.selected_regions()
         windows = self.selected_windows()
-        if not regions and not windows:
+        if not regions and not windows and not self.selected_apps:
             raise ValueError("至少选择一个屏幕或应用")
         threshold = float(self.threshold.get())
         scales = parse_scales(self.scales.get())
@@ -1058,6 +1218,7 @@ class App:
             "_base_dir": str(DATA_DIR),
             "regions": regions,
             "windows": windows,
+            "window_apps": self.selected_apps,
             "targets": [
                 {"name": t["name"], "kind": "template", "path": t["path"], "threshold": threshold, "scales": scales}
                 for t in targets
@@ -1079,6 +1240,13 @@ class App:
         self.worker = threading.Thread(target=self.run_worker, args=(config, False), daemon=True)
         self.worker.start()
         self.status.set("监控中。")
+        self.update_monitor_button()
+
+    def toggle_monitoring(self):
+        if self.is_monitoring():
+            self.stop()
+        else:
+            self.start()
 
     def scan_once(self):
         try:
@@ -1092,37 +1260,51 @@ class App:
     def stop(self):
         self.stop_event.set()
         self.status.set("正在停止。")
+        self.update_monitor_button()
 
     def run_worker(self, config, once):
         from mss import mss
 
         detector = Detector(config)
         last_seen = {}
-        with mss() as sct:
-            monitors = [{"index": i, **m} for i, m in enumerate(sct.monitors)]
-            regions = config_regions(config, monitors) if config.get("regions") else []
-            windows = config.get("windows", [])
-            while not self.stop_event.is_set():
-                started = time.perf_counter()
-                hit_count = 0
-                for region in regions:
-                    frame = capture_region(sct, region)
-                    matches = detector.run(frame)
-                    if matches:
-                        hit_count += self.emit_alert(config, last_seen, region, frame, matches)
-                for window in windows:
-                    frame = capture_window(window["hwnd"])
-                    if frame is None:
-                        continue
-                    matches = detector.run(frame)
-                    if matches:
-                        hit_count += self.emit_alert(config, last_seen, window, frame, matches)
-                elapsed = time.perf_counter() - started
-                self.events.put(("tick", f"扫描 {len(regions)} 屏 / {len(windows)} 应用 / {len(config['targets'])} 图，用时 {elapsed * 1000:.0f} ms，命中 {hit_count}"))
-                if once:
-                    return
-                time.sleep(max(0.01, config["poll_interval_seconds"] - elapsed))
-        self.events.put(("tick", "已停止"))
+        try:
+            with mss() as sct:
+                monitors = [{"index": i, **m} for i, m in enumerate(sct.monitors)]
+                regions = config_regions(config, monitors) if config.get("regions") else []
+                windows = config.get("windows", [])
+                window_apps = config.get("window_apps", [])
+                last_window_refresh = 0
+                while not self.stop_event.is_set():
+                    started = time.perf_counter()
+                    hit_count = 0
+                    if window_apps and time.time() - last_window_refresh >= 2:
+                        lookup = {item["key"]: item for item in list_app_windows()}
+                        windows = [
+                            {"name": f"app-{safe_name(item['display'])}", "title": item["title"], "display": item["display"], "hwnd": item["hwnd"], "key": item["key"]}
+                            for app in window_apps
+                            for item in [lookup.get(self.app_key(app))]
+                            if item
+                        ]
+                        last_window_refresh = time.time()
+                    for region in regions:
+                        frame = capture_region(sct, region)
+                        matches = detector.run(frame)
+                        if matches:
+                            hit_count += self.emit_alert(config, last_seen, region, frame, matches)
+                    for window in windows:
+                        frame = capture_window(window["hwnd"])
+                        if frame is None:
+                            continue
+                        matches = detector.run(frame)
+                        if matches:
+                            hit_count += self.emit_alert(config, last_seen, window, frame, matches)
+                    elapsed = time.perf_counter() - started
+                    self.events.put(("tick", f"扫描 {len(regions)} 屏 / {len(windows)} 应用 / {len(config['targets'])} 图，用时 {elapsed * 1000:.0f} ms，命中 {hit_count}"))
+                    if once:
+                        return
+                    time.sleep(max(0.01, config["poll_interval_seconds"] - elapsed))
+        finally:
+            self.events.put(("stopped", "已停止"))
 
     def emit_alert(self, config, last_seen, region, frame, matches):
         now = time.time()
@@ -1169,6 +1351,9 @@ class App:
             except queue.Empty:
                 break
             self.status.set(message)
+            if kind == "stopped":
+                self.worker = None
+                self.update_monitor_button()
             self.log.insert("", 0, values=(time.strftime("%H:%M:%S"), message))
             for item in self.log.get_children()[100:]:
                 self.log.delete(item)
