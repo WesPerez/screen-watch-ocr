@@ -33,6 +33,35 @@ class CoreTest(unittest.TestCase):
         self.assertTrue(mostly_black(np.zeros((4, 4, 3), dtype=np.uint8)))
         self.assertFalse(mostly_black(np.full((4, 4, 3), 80, dtype=np.uint8)))
 
+    def test_window_capture_falls_back_to_visible_screen_when_printwindow_black(self):
+        import numpy as np
+
+        class Rect:
+            left, top = 10, 20
+
+        class Shot:
+            width, height = 2, 2
+            rgb = bytes([10, 20, 30] * 4)
+
+        class Sct:
+            def __init__(self):
+                self.box = None
+
+            def grab(self, box):
+                self.box = box
+                return Shot()
+
+        old_capture, old_rect = appmod.capture_window, appmod.window_rect
+        try:
+            appmod.capture_window = lambda _hwnd: np.zeros((2, 2, 3), dtype=np.uint8)
+            appmod.window_rect = lambda _hwnd: (Rect(), 2, 2)
+            sct = Sct()
+            frame = appmod.capture_window_frame(sct, 123)
+            self.assertEqual(sct.box, {"left": 10, "top": 20, "width": 2, "height": 2})
+            self.assertEqual(frame.tolist(), [[[10, 20, 30], [10, 20, 30]], [[10, 20, 30], [10, 20, 30]]])
+        finally:
+            appmod.capture_window, appmod.window_rect = old_capture, old_rect
+
     def test_parse_positive_float(self):
         self.assertEqual(parse_positive_float("3.5", "beep_seconds"), 3.5)
         with self.assertRaises(ValueError):

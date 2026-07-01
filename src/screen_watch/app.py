@@ -57,10 +57,17 @@ DWM_TNP_VISIBLE = 0x8
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
 WS_EX_LAYERED = 0x00080000
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_NOACTIVATE = 0x08000000
 WS_CHILD = 0x40000000
 WS_VISIBLE = 0x10000000
 LWA_ALPHA = 0x00000002
 MW_FILTERMODE_EXCLUDE = 0
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
 PREVIEW_W = 260
 PREVIEW_H = 150
 SCREEN_PREVIEW_SECONDS = 0.5
@@ -171,6 +178,8 @@ def configure_winapi():
     user32.DestroyWindow.restype = wintypes.BOOL
     user32.MoveWindow.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.BOOL]
     user32.MoveWindow.restype = wintypes.BOOL
+    user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+    user32.SetWindowPos.restype = wintypes.BOOL
     user32.GetWindowDC.argtypes = [wintypes.HWND]
     user32.GetWindowDC.restype = wintypes.HDC
     user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
@@ -586,6 +595,23 @@ def mostly_black(frame):
     return frame is None or float(np.mean(frame)) < 8
 
 
+def capture_window_visible(sct, hwnd):
+    info = window_rect(hwnd)
+    if not info:
+        return None
+    rect, width, height = info
+    shot = sct.grab({"left": rect.left, "top": rect.top, "width": width, "height": height})
+    return np.frombuffer(shot.rgb, dtype=np.uint8).reshape(shot.height, shot.width, 3)
+
+
+def capture_window_frame(sct, hwnd):
+    frame = capture_window(hwnd)
+    if not mostly_black(frame):
+        return frame
+    visible = capture_window_visible(sct, hwnd)
+    return visible if visible is not None else frame
+
+
 def dwm_register(dest_hwnd, source_hwnd):
     if os.name != "nt":
         return None
@@ -636,12 +662,17 @@ def hwnd_for_tk(window):
             return 0
 
 
-def make_layered(hwnd):
+def set_preview_window_style(hwnd, layered=False):
     try:
         user32 = ctypes.windll.user32
         style = user32.GetWindowLongW(int(hwnd), GWL_EXSTYLE)
-        user32.SetWindowLongW(int(hwnd), GWL_EXSTYLE, style | WS_EX_LAYERED)
-        user32.SetLayeredWindowAttributes(int(hwnd), 0, 255, LWA_ALPHA)
+        style |= WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE
+        if layered:
+            style |= WS_EX_LAYERED
+        user32.SetWindowLongW(int(hwnd), GWL_EXSTYLE, style)
+        if layered:
+            user32.SetLayeredWindowAttributes(int(hwnd), 0, 255, LWA_ALPHA)
+        user32.SetWindowPos(int(hwnd), None, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
     except Exception:
         pass
 
@@ -912,21 +943,29 @@ class App:
         ttk.Label(right, textvariable=self.status, wraplength=300).pack(fill="x", pady=8)
 
     def make_entry(self, parent, var):
-        entry = ttk.Entry(parent, textvariable=var)
-        entry.bind("<FocusIn>", self.focus_entry_end)
-        entry.bind("<ButtonPress-1>", self.focus_entry_end)
-        entry.bind("<Button-1>", self.focus_entry_end)
-        entry.bind("<ButtonRelease-1>", self.focus_entry_end)
+        entry = ttk.Entry(parent, textvariable=var, justify="right")
+        for sequence in ("<FocusIn>", "<ButtonPress-1>", "<Button-1>", "<ButtonRelease-1>", "<B1-Motion>", "<Double-Button-1>"):
+            entry.bind(sequence, self.focus_entry_end)
         return entry
 
     def focus_entry_end(self, event):
         event.widget.focus_set()
-        event.widget.selection_clear()
-        event.widget.icursor("end")
-        event.widget.after_idle(lambda w=event.widget: (w.selection_clear(), w.icursor("end")))
-        event.widget.after(1, lambda w=event.widget: (w.selection_clear(), w.icursor("end")))
-        event.widget.after(50, lambda w=event.widget: (w.selection_clear(), w.icursor("end")))
+        self.entry_cursor_end(event.widget)
         return "break"
+
+    def entry_cursor_end(self, widget):
+        def apply():
+            try:
+                widget.selection_clear()
+                widget.icursor("end")
+                widget.xview_moveto(1)
+            except TclError:
+                pass
+
+        apply()
+        widget.after_idle(apply)
+        for delay in (1, 10, 50, 150):
+            widget.after(delay, apply)
 
     def make_check(self, parent, var, label, command=None):
         return ttk.Checkbutton(parent, text=label, variable=var, command=command)
@@ -1258,6 +1297,7 @@ class App:
                 pass
             window.update_idletasks()
             dest = hwnd_for_tk(window)
+            set_preview_window_style(dest)
             thumb = dwm_register(dest, hwnd)
             if not thumb:
                 window.destroy()
@@ -1297,7 +1337,7 @@ class App:
                 pass
             window.update_idletasks()
             host = hwnd_for_tk(window)
-            make_layered(host)
+            set_preview_window_style(host, layered=True)
             hwnd = mag_create(host)
             if not hwnd:
                 window.destroy()
@@ -1356,15 +1396,7 @@ class App:
             if not source.get("available"):
                 return None
             if source["kind"] == "window":
-                frame = capture_window(source["source"]["hwnd"])
-                if not mostly_black(frame):
-                    return frame
-                info = window_rect(source["source"]["hwnd"])
-                if not info:
-                    return frame
-                rect, width, height = info
-                shot = sct.grab({"left": rect.left, "top": rect.top, "width": width, "height": height})
-                return np.frombuffer(shot.rgb, dtype=np.uint8).reshape(shot.height, shot.width, 3)
+                return capture_window_frame(sct, source["source"]["hwnd"])
             else:
                 monitors = [{"index": i, **m} for i, m in enumerate(sct.monitors)]
                 region = config_regions({"regions": [source["source"]]}, monitors)[0]
@@ -1722,7 +1754,7 @@ class App:
                         if matches:
                             hit_count += self.emit_alert(config, last_seen, region, frame, matches)
                     for window in windows:
-                        frame = capture_window(window["hwnd"])
+                        frame = capture_window_frame(sct, window["hwnd"])
                         if frame is None:
                             continue
                         matches = detector.run(frame)
