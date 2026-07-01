@@ -1,0 +1,17 @@
+{
+  "poll_interval_seconds": 0.25,
+  "cooldown_seconds": 2,
+  "regions": [
+    { "name": "primary-top-left", "monitor": 1, "left": 0, "top": 0, "width": 640, "height": 360 }
+  ],
+  "targets": [
+    { "name": "sample-logo", "kind": "template", "path": "templates/sample.png", "threshold": 0.91, "scales": [0.9, 1.0, 1.1] },
+    { "name": "sample-red-dot", "kind": "pixel", "x": 50, "y": 50, "rgb": [255, 0, 0], "tolerance": 12 },
+    { "name": "sample-warning-text", "kind": "ocr_text", "text": "WARNING", "min_score": 0.4 }
+  ],
+  "alarm": {
+    "beep": true,
+    "save_dir": "evidence/alerts",
+    "jsonl": "evidence/alerts.jsonl"
+  }
+}

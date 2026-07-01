@@ -1,0 +1,9 @@
+.venv/
+build/
+dist/
+app_data/
+evidence/
+demo/
+__pycache__/
+*.py[cod]
+*.egg-info/
