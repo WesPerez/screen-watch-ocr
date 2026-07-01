@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from tkinter import BooleanVar, Canvas, Checkbutton, DoubleVar, Frame, IntVar, Label, PanedWindow, StringVar, Tk, filedialog, messagebox, ttk
+from tkinter import BooleanVar, Canvas, DoubleVar, Frame, IntVar, Label, PanedWindow, StringVar, Tk, filedialog, messagebox, ttk
 import tkinter.font as tkfont
 
 import cv2
@@ -256,6 +256,7 @@ class App:
         self.loading_profile = False
         self.targets = []
         self.thumb_refs = []
+        self.target_vars = []
         self.thumb_cache = {}
         self.selected_target = None
         self.thumb_w = 128
@@ -430,7 +431,7 @@ class App:
         path = save_template(image, name)
         thumb = save_thumb(image, path)
         width, height = Image.open(path).size
-        self.targets.append({"name": path.stem, "path": str(path), "thumb": str(thumb), "size": f"{width}x{height}"})
+        self.targets.append({"name": path.stem, "path": str(path), "thumb": str(thumb), "size": f"{width}x{height}", "enabled": True})
         self.selected_target = len(self.targets) - 1
         self.reload_target_list()
         self.save_current_profile()
@@ -453,6 +454,11 @@ class App:
         self.selected_target = index
         self.reload_target_list()
 
+    def toggle_target(self, index, var):
+        self.targets[index]["enabled"] = bool(var.get())
+        self.save_current_profile()
+        self.status.set(f"当前 {len(self.targets)} 张模板，启用 {len(self.enabled_targets())} 张。")
+
     def remove_selected(self):
         if self.selected_target is not None and self.selected_target < len(self.targets):
             self.targets.pop(self.selected_target)
@@ -470,6 +476,7 @@ class App:
         for child in self.gallery_inner.winfo_children():
             child.destroy()
         self.thumb_refs.clear()
+        self.target_vars.clear()
         columns = 5
         for idx, target in enumerate(self.targets):
             row, col = divmod(idx, columns)
@@ -480,10 +487,13 @@ class App:
                 relief="solid",
                 bg="#cfe8ff" if selected else "#f6f6f6",
                 width=self.thumb_w + 16,
-                height=self.thumb_h + int(36 * self.last_scale),
+                height=self.thumb_h + int(58 * self.last_scale),
             )
             card.grid(row=row, column=col, padx=6, pady=6, sticky="n")
             card.grid_propagate(False)
+            enabled_var = BooleanVar(value=target.get("enabled", True))
+            self.target_vars.append(enabled_var)
+            ttk.Checkbutton(card, variable=enabled_var, text="匹配", command=lambda i=idx, v=enabled_var: self.toggle_target(i, v)).pack(anchor="w", padx=4, pady=(3, 0))
             thumb = self.make_thumb(target)
             self.thumb_refs.append(thumb)
             image = Label(card, image=thumb, bg=card["bg"], width=self.thumb_w, height=self.thumb_h)
@@ -493,7 +503,10 @@ class App:
             for widget in (card, image, text):
                 widget.bind("<Button-1>", lambda _event, i=idx: self.select_target(i))
         self.target_canvas.configure(height=max(180, int((self.thumb_h + 54) * 2)))
-        self.status.set(f"当前 {len(self.targets)} 张模板。")
+        self.status.set(f"当前 {len(self.targets)} 张模板，启用 {len(self.enabled_targets())} 张。")
+
+    def enabled_targets(self):
+        return [t for t in self.targets if t.get("enabled", True)]
 
     def profile_path(self, number=None):
         return PROFILES_DIR / f"profile_{number or self.current_profile}.json"
@@ -676,8 +689,11 @@ class App:
         return region
 
     def detector_config(self):
+        targets = self.enabled_targets()
         if not self.targets:
             raise ValueError("先添加至少一张模板图片")
+        if not targets:
+            raise ValueError("至少勾选一张要匹配的模板图片")
         regions = self.selected_regions()
         if not regions:
             raise ValueError("至少选择一个屏幕")
@@ -690,7 +706,7 @@ class App:
             "regions": regions,
             "targets": [
                 {"name": t["name"], "kind": "template", "path": t["path"], "threshold": threshold, "scales": scales}
-                for t in self.targets
+                for t in targets
             ],
             "cooldown_seconds": float(self.cooldown.get()),
             "poll_interval_seconds": int(self.interval_ms.get()) / 1000,
