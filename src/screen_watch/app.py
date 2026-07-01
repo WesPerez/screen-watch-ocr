@@ -51,8 +51,13 @@ PW_RENDERFULLCONTENT = 0x00000002
 GW_OWNER = 4
 GWL_EXSTYLE = -20
 DWMWA_CLOAKED = 14
+DWM_TNP_RECTDESTINATION = 0x1
+DWM_TNP_OPACITY = 0x4
+DWM_TNP_VISIBLE = 0x8
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
+PREVIEW_W = 260
+PREVIEW_H = 150
 
 
 class BitmapInfoHeader(ctypes.Structure):
@@ -83,6 +88,21 @@ class WindowPlacement(ctypes.Structure):
         ("ptMinPosition", wintypes.POINT),
         ("ptMaxPosition", wintypes.POINT),
         ("rcNormalPosition", wintypes.RECT),
+    ]
+
+
+class Size(ctypes.Structure):
+    _fields_ = [("cx", ctypes.c_int), ("cy", ctypes.c_int)]
+
+
+class DwmThumbnailProperties(ctypes.Structure):
+    _fields_ = [
+        ("dwFlags", wintypes.DWORD),
+        ("rcDestination", wintypes.RECT),
+        ("rcSource", wintypes.RECT),
+        ("opacity", ctypes.c_ubyte),
+        ("fVisible", wintypes.BOOL),
+        ("fSourceClientAreaOnly", wintypes.BOOL),
     ]
 
 
@@ -136,6 +156,14 @@ def configure_winapi():
         dwmapi = ctypes.windll.dwmapi
         dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD]
         dwmapi.DwmGetWindowAttribute.restype = ctypes.HRESULT
+        dwmapi.DwmRegisterThumbnail.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.POINTER(wintypes.HANDLE)]
+        dwmapi.DwmRegisterThumbnail.restype = ctypes.HRESULT
+        dwmapi.DwmUnregisterThumbnail.argtypes = [wintypes.HANDLE]
+        dwmapi.DwmUnregisterThumbnail.restype = ctypes.HRESULT
+        dwmapi.DwmUpdateThumbnailProperties.argtypes = [wintypes.HANDLE, ctypes.POINTER(DwmThumbnailProperties)]
+        dwmapi.DwmUpdateThumbnailProperties.restype = ctypes.HRESULT
+        dwmapi.DwmQueryThumbnailSourceSize.argtypes = [wintypes.HANDLE, ctypes.POINTER(Size)]
+        dwmapi.DwmQueryThumbnailSourceSize.restype = ctypes.HRESULT
     except Exception:
         pass
     _WINAPI_READY = True
@@ -493,6 +521,46 @@ def capture_window(hwnd):
         user32.ReleaseDC(int(hwnd), hwnd_dc)
 
 
+def dwm_register(dest_hwnd, source_hwnd):
+    if os.name != "nt":
+        return None
+    configure_winapi()
+    try:
+        thumb = wintypes.HANDLE()
+        if ctypes.windll.dwmapi.DwmRegisterThumbnail(int(dest_hwnd), int(source_hwnd), ctypes.byref(thumb)) != 0:
+            return None
+        return thumb
+    except Exception:
+        return None
+
+
+def dwm_unregister(thumb):
+    try:
+        if thumb:
+            ctypes.windll.dwmapi.DwmUnregisterThumbnail(thumb)
+    except Exception:
+        pass
+
+
+def dwm_update(thumb, left, top, width, height):
+    try:
+        src = Size()
+        ctypes.windll.dwmapi.DwmQueryThumbnailSourceSize(thumb, ctypes.byref(src))
+        src_w, src_h = max(1, src.cx), max(1, src.cy)
+        scale = min(width / src_w, height / src_h)
+        dst_w, dst_h = max(1, int(src_w * scale)), max(1, int(src_h * scale))
+        x = left + (width - dst_w) // 2
+        y = top + (height - dst_h) // 2
+        props = DwmThumbnailProperties()
+        props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY
+        props.rcDestination = wintypes.RECT(x, y, x + dst_w, y + dst_h)
+        props.opacity = 255
+        props.fVisible = True
+        return ctypes.windll.dwmapi.DwmUpdateThumbnailProperties(thumb, ctypes.byref(props)) == 0
+    except Exception:
+        return False
+
+
 def beep_for(seconds):
     try:
         import winsound
@@ -536,10 +604,15 @@ class App:
         self.window_choice = StringVar(value="选择应用...")
         self.window_refresh_job = None
         self.source_widgets = {}
+        self.dwm_thumbs = {}
+        self.preview_sources = []
+        self.preview_frames = {}
+        self.preview_lock = threading.Lock()
         self.preview_job = None
         self.worker = None
         self.tray_icon = None
         self.stop_event = threading.Event()
+        self.close_event = threading.Event()
         self.beep_lock = threading.Lock()
         self.beep_until = 0
         self.events = queue.Queue()
@@ -569,6 +642,7 @@ class App:
         self.root.bind_all("<Control-V>", self.handle_paste_hotkey)
         self.root.bind("<Configure>", self.on_resize)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        threading.Thread(target=self.run_preview_worker, daemon=True).start()
         self.root.after(250, self.restore_layout)
         self.root.after(1000, self.refresh_windows_loop)
         self.root.after(120, self.refresh_source_previews)
@@ -896,17 +970,23 @@ class App:
 
     def refresh_source_previews(self):
         try:
-            sources = {}
+            sources = []
             for monitor in self.selected_regions():
-                sources[f"screen:{monitor['name']}"] = ("screen", monitor["name"], monitor, True)
+                sources.append({"key": f"screen:{monitor['name']}", "kind": "screen", "name": monitor["name"], "source": monitor, "available": True})
             for app in self.selected_apps:
                 item = self.window_info.get(self.app_key(app))
                 name = item["display"] if item else window_display(app["title"], app.get("ordinal", 1), app.get("ordinal", 1) > 1)
-                sources[f"app:{self.app_key(app)}"] = ("window", name, item, bool(item))
+                sources.append({"key": f"app:{self.app_key(app)}", "kind": "window", "name": name, "source": item, "available": bool(item), "dwm": bool(item and os.name == "nt")})
+            source_keys = {item["key"] for item in sources}
+            with self.preview_lock:
+                self.preview_sources = [dict(item) for item in sources]
             for key in list(self.source_widgets):
-                if key not in sources:
+                if key not in source_keys:
+                    self.unregister_dwm_preview(key)
                     self.source_widgets[key]["frame"].destroy()
                     del self.source_widgets[key]
+                    with self.preview_lock:
+                        self.preview_frames.pop(key, None)
             if not sources and "empty" not in self.source_widgets:
                 frame = ttk.Frame(self.source_frame)
                 frame.pack(fill="x", padx=6, pady=6)
@@ -915,53 +995,106 @@ class App:
             elif sources and "empty" in self.source_widgets:
                 self.source_widgets["empty"]["frame"].destroy()
                 del self.source_widgets["empty"]
-            for key, (kind, name, source, available) in sources.items():
+            for source in sources:
+                key = source["key"]
                 widgets = self.source_widgets.get(key)
                 if not widgets:
                     outer = ttk.Frame(self.source_frame)
                     outer.pack(fill="x", padx=6, pady=6)
-                    image_label = Label(outer)
+                    image_label = Label(outer, bg="#141414", width=PREVIEW_W, height=PREVIEW_H)
                     image_label.pack(fill="x")
                     name_label = ttk.Label(outer, wraplength=260)
                     name_label.pack(anchor="w", pady=(2, 0))
                     self.source_widgets[key] = {"frame": outer, "image": image_label, "name": name_label}
                     widgets = self.source_widgets[key]
-                photo = self.preview_image(kind, source) if available else self.placeholder_image("未启动")
-                widgets["image"].configure(image=photo)
-                widgets["image"].image = photo
-                widgets["name"].configure(text=name if available else f"{name}（未启动）")
+                if source.get("dwm") and self.sync_dwm_preview(key, widgets["image"], source["source"]["hwnd"]):
+                    widgets["image"].configure(image="")
+                    widgets["image"].image = None
+                else:
+                    self.unregister_dwm_preview(key)
+                    with self.preview_lock:
+                        frame = self.preview_frames.get(key)
+                    photo = self.photo_from_frame(frame) if source["available"] and frame is not None else self.placeholder_image("未启动")
+                    widgets["image"].configure(image=photo)
+                    widgets["image"].image = photo
+                widgets["name"].configure(text=source["name"] if source["available"] else f"{source['name']}（未启动）")
         except Exception:
             pass
         finally:
             try:
-                self.preview_job = self.root.after(120, self.refresh_source_previews)
+                self.preview_job = self.root.after(33, self.refresh_source_previews)
             except TclError:
                 pass
 
-    def preview_image(self, kind, source):
-        try:
-            if kind == "window":
-                frame = capture_window(source["hwnd"])
-            else:
-                from mss import mss
+    def unregister_dwm_preview(self, key):
+        record = self.dwm_thumbs.pop(key, None)
+        if record:
+            dwm_unregister(record["thumb"])
 
-                with mss() as sct:
-                    monitors = [{"index": i, **m} for i, m in enumerate(sct.monitors)]
-                    region = config_regions({"regions": [source]}, monitors)[0]
-                    frame = capture_region(sct, region)
-            if frame is None:
-                return None
-            img = Image.fromarray(frame).convert("RGB")
-            width, height = 260, 150
-            img.thumbnail((width, height))
-            canvas = Image.new("RGB", (width, height), (245, 245, 245))
-            canvas.paste(img, ((width - img.width) // 2, (height - img.height) // 2))
-            return ImageTk.PhotoImage(canvas)
+    def sync_dwm_preview(self, key, widget, hwnd):
+        record = self.dwm_thumbs.get(key)
+        if not record or record.get("hwnd") != hwnd:
+            self.unregister_dwm_preview(key)
+            try:
+                dest = int(self.root.frame(), 16)
+            except Exception:
+                dest = self.root.winfo_id()
+            thumb = dwm_register(dest, hwnd)
+            if not thumb:
+                return False
+            self.dwm_thumbs[key] = {"thumb": thumb, "hwnd": hwnd}
+            record = self.dwm_thumbs[key]
+        try:
+            left = widget.winfo_rootx() - self.root.winfo_rootx()
+            top = widget.winfo_rooty() - self.root.winfo_rooty()
+            return dwm_update(record["thumb"], left, top, widget.winfo_width() or PREVIEW_W, widget.winfo_height() or PREVIEW_H)
         except Exception:
-            return self.placeholder_image("无画面")
+            return False
+
+    def run_preview_worker(self):
+        try:
+            from mss import mss
+
+            with mss() as sct:
+                while not self.close_event.is_set():
+                    with self.preview_lock:
+                        sources = [dict(item) for item in self.preview_sources]
+                    for source in sources:
+                        if self.close_event.is_set():
+                            return
+                        if source.get("dwm"):
+                            continue
+                        frame = self.capture_preview_frame(sct, source)
+                        if frame is not None:
+                            with self.preview_lock:
+                                self.preview_frames[source["key"]] = frame
+                    time.sleep(0.03)
+        except Exception:
+            pass
+
+    def capture_preview_frame(self, sct, source):
+        try:
+            if not source.get("available"):
+                return None
+            if source["kind"] == "window":
+                return capture_window(source["source"]["hwnd"])
+            else:
+                monitors = [{"index": i, **m} for i, m in enumerate(sct.monitors)]
+                region = config_regions({"regions": [source["source"]]}, monitors)[0]
+                return capture_region(sct, region)
+        except Exception:
+            return None
+
+    def photo_from_frame(self, frame):
+        img = Image.fromarray(frame).convert("RGB")
+        width, height = PREVIEW_W, PREVIEW_H
+        img.thumbnail((width, height))
+        canvas = Image.new("RGB", (width, height), (245, 245, 245))
+        canvas.paste(img, ((width - img.width) // 2, (height - img.height) // 2))
+        return ImageTk.PhotoImage(canvas)
 
     def placeholder_image(self, text):
-        width, height = 260, 150
+        width, height = PREVIEW_W, PREVIEW_H
         canvas = Image.new("RGB", (width, height), (20, 20, 20))
         return ImageTk.PhotoImage(canvas)
 
@@ -1102,6 +1235,9 @@ class App:
         self.save_current_profile()
         self.save_state()
         self.stop_event.set()
+        self.close_event.set()
+        for key in list(self.dwm_thumbs):
+            self.unregister_dwm_preview(key)
         if self.tray_icon:
             self.tray_icon.stop()
             self.tray_icon = None
