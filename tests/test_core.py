@@ -5,7 +5,7 @@ from pathlib import Path
 from PIL import Image
 
 import screen_watch.app as appmod
-from screen_watch.app import app_from_legacy, parse_positive_float, parse_positive_int, parse_scales, prune_alerts, template_name, window_key
+from screen_watch.app import app_from_legacy, mostly_black, parse_positive_float, parse_positive_int, parse_scales, prune_alerts, scan_interval_ms, template_name, window_key
 from screen_watch.core import self_test
 
 
@@ -22,6 +22,16 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(parse_positive_int("50", "beep_count"), 50)
         with self.assertRaises(ValueError):
             parse_positive_int("0", "beep_count")
+
+    def test_scan_interval_has_safe_floor(self):
+        self.assertEqual(scan_interval_ms("1"), appmod.MIN_SCAN_INTERVAL_MS)
+        self.assertEqual(scan_interval_ms("250"), 250)
+
+    def test_mostly_black_detects_blank_preview(self):
+        import numpy as np
+
+        self.assertTrue(mostly_black(np.zeros((4, 4, 3), dtype=np.uint8)))
+        self.assertFalse(mostly_black(np.full((4, 4, 3), 80, dtype=np.uint8)))
 
     def test_parse_positive_float(self):
         self.assertEqual(parse_positive_float("3.5", "beep_seconds"), 3.5)
