@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from tkinter import BooleanVar, Canvas, DoubleVar, Frame, IntVar, Label, PanedWindow, StringVar, Tk, filedialog, messagebox, ttk
+from tkinter import BooleanVar, Canvas, DoubleVar, Frame, IntVar, Label, PanedWindow, StringVar, Tk, Toplevel, filedialog, messagebox, ttk
 from tkinter import TclError
 import tkinter.font as tkfont
 from ctypes import wintypes
@@ -58,6 +58,7 @@ WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
 PREVIEW_W = 260
 PREVIEW_H = 150
+SCREEN_PREVIEW_SECONDS = 0.5
 
 
 class BitmapInfoHeader(ctypes.Structure):
@@ -1030,24 +1031,43 @@ class App:
         record = self.dwm_thumbs.pop(key, None)
         if record:
             dwm_unregister(record["thumb"])
+            window = record.get("window")
+            if window:
+                try:
+                    window.destroy()
+                except TclError:
+                    pass
 
     def sync_dwm_preview(self, key, widget, hwnd):
         record = self.dwm_thumbs.get(key)
         if not record or record.get("hwnd") != hwnd:
             self.unregister_dwm_preview(key)
+            window = Toplevel(self.root)
+            window.withdraw()
+            window.overrideredirect(True)
+            window.transient(self.root)
+            window.configure(bg="#141414")
+            window.update_idletasks()
             try:
-                dest = int(self.root.frame(), 16)
+                dest = int(window.frame(), 16)
             except Exception:
-                dest = self.root.winfo_id()
+                dest = window.winfo_id()
             thumb = dwm_register(dest, hwnd)
             if not thumb:
+                window.destroy()
                 return False
-            self.dwm_thumbs[key] = {"thumb": thumb, "hwnd": hwnd}
+            self.dwm_thumbs[key] = {"thumb": thumb, "hwnd": hwnd, "window": window}
             record = self.dwm_thumbs[key]
         try:
-            left = widget.winfo_rootx() - self.root.winfo_rootx()
-            top = widget.winfo_rooty() - self.root.winfo_rooty()
-            return dwm_update(record["thumb"], left, top, widget.winfo_width() or PREVIEW_W, widget.winfo_height() or PREVIEW_H)
+            window = record["window"]
+            if self.root.state() in {"withdrawn", "iconic"} or not widget.winfo_viewable():
+                window.withdraw()
+                return True
+            width, height = widget.winfo_width() or PREVIEW_W, widget.winfo_height() or PREVIEW_H
+            window.geometry(f"{width}x{height}+{widget.winfo_rootx()}+{widget.winfo_rooty()}")
+            window.deiconify()
+            window.lift(self.root)
+            return dwm_update(record["thumb"], 0, 0, width, height)
         except Exception:
             return False
 
@@ -1068,7 +1088,7 @@ class App:
                         if frame is not None:
                             with self.preview_lock:
                                 self.preview_frames[source["key"]] = frame
-                    time.sleep(0.03)
+                    time.sleep(SCREEN_PREVIEW_SECONDS)
         except Exception:
             pass
 
