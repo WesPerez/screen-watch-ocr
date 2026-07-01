@@ -5,7 +5,7 @@ from pathlib import Path
 from PIL import Image
 
 import screen_watch.app as appmod
-from screen_watch.app import parse_positive_float, parse_positive_int, parse_scales, prune_alerts
+from screen_watch.app import parse_positive_float, parse_positive_int, parse_scales, prune_alerts, template_name
 from screen_watch.core import self_test
 
 
@@ -28,6 +28,9 @@ class CoreTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_positive_float("0", "beep_seconds")
 
+    def test_template_name_uses_profile_count_date(self):
+        self.assertEqual(template_name(1, 11, "20260701"), "1-11-20260701")
+
     def test_profile_roundtrip(self):
         old_data, old_profiles, old_state = appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH
         old_legacy = appmod.LEGACY_DATA_DIR
@@ -47,6 +50,7 @@ class CoreTest(unittest.TestCase):
                 app.current_profile = 5
                 app.profile.set(5)
                 app.max_alerts.set(10)
+                app.max_templates.set(20)
                 template = appmod.DATA_DIR / "templates" / "target.png"
                 template.parent.mkdir(parents=True, exist_ok=True)
                 Image.new("RGB", (12, 10), "red").save(template)
@@ -67,6 +71,7 @@ class CoreTest(unittest.TestCase):
                 self.assertEqual(app2.width.get(), "333")
                 self.assertEqual(app2.beep_seconds.get(), 5)
                 self.assertEqual(app2.max_alerts.get(), 10)
+                self.assertEqual(app2.max_templates.get(), 20)
                 self.assertEqual(len(app2.targets), 1)
                 self.assertFalse(app2.targets[0]["enabled"])
                 self.assertIn("layout", appmod.load_json(appmod.STATE_PATH, {}))
@@ -134,6 +139,66 @@ class CoreTest(unittest.TestCase):
                 app.targets[0]["enabled"] = False
                 with self.assertRaises(ValueError):
                     app.detector_config()
+                root.destroy()
+            finally:
+                appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH = old_data, old_profiles, old_state
+                appmod.LEGACY_DATA_DIR = old_legacy
+                appmod.THUMBS_DIR, appmod.ALERTS_DIR = old_thumbs, old_alerts
+
+    def test_detector_config_allows_window_only_source(self):
+        old_data, old_profiles, old_state = appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH
+        old_legacy, old_thumbs, old_alerts = appmod.LEGACY_DATA_DIR, appmod.THUMBS_DIR, appmod.ALERTS_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            appmod.DATA_DIR = base / "app_data"
+            appmod.LEGACY_DATA_DIR = base / "missing_legacy"
+            appmod.PROFILES_DIR = appmod.DATA_DIR / "profiles"
+            appmod.STATE_PATH = appmod.DATA_DIR / "state.json"
+            appmod.THUMBS_DIR = appmod.DATA_DIR / "thumbs"
+            appmod.ALERTS_DIR = appmod.DATA_DIR / "screenshots"
+            try:
+                root = appmod.Tk()
+                root.withdraw()
+                app = appmod.App(root)
+                app.monitor_vars = {1: appmod.BooleanVar(value=False)}
+                app.window_info = {123: {"title": "Demo", "hwnd": 123, "width": 200, "height": 100}}
+                app.window_vars = {123: appmod.BooleanVar(value=True)}
+                one = appmod.DATA_DIR / "templates" / "one.png"
+                one.parent.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (12, 10), "red").save(one)
+                app.targets = [{"name": "one", "path": str(one), "enabled": True}]
+                config = app.detector_config()
+                self.assertEqual(config["regions"], [])
+                self.assertEqual(config["windows"][0]["title"], "Demo")
+                root.destroy()
+            finally:
+                appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH = old_data, old_profiles, old_state
+                appmod.LEGACY_DATA_DIR = old_legacy
+                appmod.THUMBS_DIR, appmod.ALERTS_DIR = old_thumbs, old_alerts
+
+    def test_add_image_prunes_to_template_limit_before_naming(self):
+        old_data, old_profiles, old_state = appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH
+        old_legacy, old_thumbs, old_alerts = appmod.LEGACY_DATA_DIR, appmod.THUMBS_DIR, appmod.ALERTS_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            appmod.DATA_DIR = base / "app_data"
+            appmod.LEGACY_DATA_DIR = base / "missing_legacy"
+            appmod.PROFILES_DIR = appmod.DATA_DIR / "profiles"
+            appmod.STATE_PATH = appmod.DATA_DIR / "state.json"
+            appmod.THUMBS_DIR = appmod.DATA_DIR / "thumbs"
+            appmod.ALERTS_DIR = appmod.DATA_DIR / "screenshots"
+            try:
+                root = appmod.Tk()
+                root.withdraw()
+                app = appmod.App(root)
+                app.current_profile = 1
+                app.max_templates.set(2)
+                app.add_image("one", Image.new("RGB", (12, 10), "red"))
+                app.add_image("two", Image.new("RGB", (12, 10), "blue"))
+                app.add_image("three", Image.new("RGB", (12, 10), "green"))
+                self.assertEqual(len(app.targets), 2)
+                self.assertTrue(Path(app.targets[-1]["path"]).name.startswith("1-2-"))
+                self.assertFalse(any(Path(t["path"]).name.startswith("1-1-") for t in app.targets))
                 root.destroy()
             finally:
                 appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH = old_data, old_profiles, old_state

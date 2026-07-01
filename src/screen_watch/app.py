@@ -1,4 +1,5 @@
 import argparse
+import ctypes
 import json
 import os
 import queue
@@ -10,7 +11,9 @@ import threading
 import time
 from pathlib import Path
 from tkinter import BooleanVar, Canvas, DoubleVar, Frame, IntVar, Label, PanedWindow, StringVar, Tk, filedialog, messagebox, ttk
+from tkinter import TclError
 import tkinter.font as tkfont
+from ctypes import wintypes
 
 import cv2
 import numpy as np
@@ -41,6 +44,82 @@ THUMBS_DIR = DATA_DIR / "thumbs"
 ALERTS_DIR = DATA_DIR / "screenshots"
 PROFILE_COUNT = 5
 STARTUP_LINK_NAME = "屏幕监控OCR.lnk"
+MAX_WINDOW_ROWS = 30
+SRCCOPY = 0x00CC0020
+DIB_RGB_COLORS = 0
+PW_RENDERFULLCONTENT = 0x00000002
+
+
+class BitmapInfoHeader(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+class BitmapInfo(ctypes.Structure):
+    _fields_ = [("bmiHeader", BitmapInfoHeader), ("bmiColors", wintypes.DWORD * 3)]
+
+
+class WindowPlacement(ctypes.Structure):
+    _fields_ = [
+        ("length", wintypes.UINT),
+        ("flags", wintypes.UINT),
+        ("showCmd", wintypes.UINT),
+        ("ptMinPosition", wintypes.POINT),
+        ("ptMaxPosition", wintypes.POINT),
+        ("rcNormalPosition", wintypes.RECT),
+    ]
+
+
+_WINAPI_READY = False
+
+
+def configure_winapi():
+    global _WINAPI_READY
+    if _WINAPI_READY or os.name != "nt":
+        return
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+    user32.GetWindowPlacement.argtypes = [wintypes.HWND, ctypes.POINTER(WindowPlacement)]
+    user32.GetWindowPlacement.restype = wintypes.BOOL
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowDC.argtypes = [wintypes.HWND]
+    user32.GetWindowDC.restype = wintypes.HDC
+    user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+    user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
+    user32.PrintWindow.restype = wintypes.BOOL
+    gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+    gdi32.CreateCompatibleDC.restype = wintypes.HDC
+    gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+    gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+    gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+    gdi32.SelectObject.restype = wintypes.HGDIOBJ
+    gdi32.BitBlt.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+    gdi32.BitBlt.restype = wintypes.BOOL
+    gdi32.GetDIBits.argtypes = [wintypes.HDC, wintypes.HBITMAP, wintypes.UINT, wintypes.UINT, wintypes.LPVOID, ctypes.POINTER(BitmapInfo), wintypes.UINT]
+    gdi32.GetDIBits.restype = ctypes.c_int
+    gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+    gdi32.DeleteDC.argtypes = [wintypes.HDC]
+    _WINAPI_READY = True
 
 
 def startup_dir():
@@ -145,6 +224,14 @@ def safe_name(text):
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", text)[:70] or "target"
 
 
+def is_under(path, parent):
+    try:
+        Path(path).resolve().relative_to(Path(parent).resolve())
+        return True
+    except Exception:
+        return False
+
+
 def parse_scales(text):
     values = [float(x.strip()) for x in text.split(",") if x.strip()]
     if not values:
@@ -179,11 +266,18 @@ def write_json(path, data):
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def save_template(image, name):
+def template_stamp():
+    return time.strftime("%Y%m%d%H%M%S") + f"{time.time_ns() % 1_000_000_000:09d}"
+
+
+def template_name(profile, count, stamp=None):
+    return f"{int(profile)}-{int(count)}-{stamp or template_stamp()}"
+
+
+def save_template(image, profile, count, stamp=None):
     target_dir = DATA_DIR / "templates"
     target_dir.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000_000:09d}"
-    path = target_dir / f"{stamp}-{safe_name(name)}.png"
+    path = target_dir / f"{template_name(profile, count, stamp)}.png"
     image.convert("RGB").save(path)
     return path
 
@@ -228,6 +322,107 @@ def read_clipboard_images():
     return images
 
 
+def list_app_windows():
+    if os.name != "nt":
+        return []
+    configure_winapi()
+    user32 = ctypes.windll.user32
+    windows = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def enum_proc(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        title = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, title, length + 1)
+        text = title.value.strip()
+        if not text or text in {APP_NAME, "Screen Watch OCR", "Program Manager"}:
+            return True
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return True
+        width, height = rect.right - rect.left, rect.bottom - rect.top
+        if width < 40 or height < 40:
+            return True
+        windows.append({"hwnd": int(hwnd), "title": text, "width": width, "height": height})
+        return True
+
+    user32.EnumWindows(enum_proc, 0)
+    seen = set()
+    out = []
+    for item in windows:
+        key = (item["hwnd"], item["title"])
+        if key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out[:MAX_WINDOW_ROWS]
+
+
+def window_rect(hwnd):
+    configure_winapi()
+    user32 = ctypes.windll.user32
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    if user32.IsIconic(hwnd):
+        placement = WindowPlacement()
+        placement.length = ctypes.sizeof(WindowPlacement)
+        if user32.GetWindowPlacement(hwnd, ctypes.byref(placement)):
+            rect = placement.rcNormalPosition
+    width, height = rect.right - rect.left, rect.bottom - rect.top
+    if width < 2 or height < 2:
+        return None
+    return rect, width, height
+
+
+def capture_window(hwnd):
+    if os.name != "nt":
+        return None
+    configure_winapi()
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+    info = window_rect(int(hwnd))
+    if not info:
+        return None
+    _rect, width, height = info
+    hwnd_dc = user32.GetWindowDC(int(hwnd))
+    if not hwnd_dc:
+        return None
+    mem_dc = gdi32.CreateCompatibleDC(hwnd_dc)
+    bitmap = gdi32.CreateCompatibleBitmap(hwnd_dc, width, height)
+    old_obj = gdi32.SelectObject(mem_dc, bitmap)
+    try:
+        ok = user32.PrintWindow(int(hwnd), mem_dc, PW_RENDERFULLCONTENT)
+        if not ok:
+            gdi32.BitBlt(mem_dc, 0, 0, width, height, hwnd_dc, 0, 0, SRCCOPY)
+        bmi = BitmapInfo()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BitmapInfoHeader)
+        bmi.bmiHeader.biWidth = width
+        bmi.bmiHeader.biHeight = -height
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = 0
+        buffer = ctypes.create_string_buffer(width * height * 4)
+        rows = gdi32.GetDIBits(mem_dc, bitmap, 0, height, buffer, ctypes.byref(bmi), DIB_RGB_COLORS)
+        if rows != height:
+            return None
+        bgra = np.frombuffer(buffer, dtype=np.uint8).reshape((height, width, 4))
+        return bgra[:, :, [2, 1, 0]].copy()
+    except Exception:
+        return None
+    finally:
+        if old_obj:
+            gdi32.SelectObject(mem_dc, old_obj)
+        if bitmap:
+            gdi32.DeleteObject(bitmap)
+        if mem_dc:
+            gdi32.DeleteDC(mem_dc)
+        user32.ReleaseDC(int(hwnd), hwnd_dc)
+
+
 def beep_for(seconds):
     try:
         import winsound
@@ -265,6 +460,11 @@ class App:
         self.resize_job = None
         self.layout_restore_job = None
         self.monitor_vars = {}
+        self.window_vars = {}
+        self.window_info = {}
+        self.saved_window_titles = []
+        self.source_refs = []
+        self.preview_job = None
         self.worker = None
         self.tray_icon = None
         self.stop_event = threading.Event()
@@ -278,6 +478,7 @@ class App:
         self.interval_ms = IntVar(value=250)
         self.cooldown = DoubleVar(value=1.0)
         self.beep_seconds = DoubleVar(value=3.0)
+        self.max_templates = IntVar(value=100)
         self.max_alerts = IntVar(value=int(self.state.get("max_alerts", 50)))
         self.beep = BooleanVar(value=True)
         self.left = StringVar(value="0")
@@ -290,20 +491,32 @@ class App:
         self.style = ttk.Style()
         self._build()
         self.refresh_monitors()
+        self.refresh_windows()
         self.load_profile(self.current_profile)
-        self.root.bind("<Control-v>", lambda _event: self.paste_images())
+        self.root.bind_all("<Control-v>", self.handle_paste_hotkey)
+        self.root.bind_all("<Control-V>", self.handle_paste_hotkey)
         self.root.bind("<Configure>", self.on_resize)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(250, self.restore_layout)
+        self.root.after(1000, self.refresh_source_previews)
         self.root.after(100, self.poll_events)
 
     def _build(self):
         self.main_pane = PanedWindow(self.root, orient="horizontal", sashwidth=8, sashrelief="raised", bd=0)
         self.main_pane.pack(fill="both", expand=True, padx=12, pady=12)
         left = ttk.Frame(self.main_pane)
-        right = ttk.Frame(self.main_pane, width=330)
+        right_outer = ttk.Frame(self.main_pane, width=330)
+        right_canvas = Canvas(right_outer, highlightthickness=0)
+        right_scroll = ttk.Scrollbar(right_outer, orient="vertical", command=right_canvas.yview)
+        right_canvas.configure(yscrollcommand=right_scroll.set)
+        right_scroll.pack(side="right", fill="y")
+        right_canvas.pack(side="left", fill="both", expand=True)
+        right = ttk.Frame(right_canvas)
+        right_window = right_canvas.create_window((0, 0), window=right, anchor="nw")
+        right.bind("<Configure>", lambda _event: right_canvas.configure(scrollregion=right_canvas.bbox("all")))
+        right_canvas.bind("<Configure>", lambda event: right_canvas.itemconfigure(right_window, width=event.width))
         self.main_pane.add(left, minsize=360)
-        self.main_pane.add(right, minsize=260)
+        self.main_pane.add(right_outer, minsize=260)
         self.main_pane.bind("<ButtonRelease-1>", lambda _event: self.capture_layout_ratios())
 
         profile_bar = ttk.Frame(left)
@@ -333,6 +546,7 @@ class App:
         scroll = ttk.Scrollbar(gallery_box, orient="vertical", command=self.target_canvas.yview)
         scroll.pack(side="right", fill="y")
         self.target_canvas.configure(yscrollcommand=scroll.set)
+        self.target_canvas.bind("<Button-1>", lambda _event: self.target_canvas.focus_set())
         self.gallery_inner = ttk.Frame(self.target_canvas)
         self.gallery_window = self.target_canvas.create_window((0, 0), window=self.gallery_inner, anchor="nw")
         self.gallery_inner.bind("<Configure>", lambda _event: self.target_canvas.configure(scrollregion=self.target_canvas.bbox("all")))
@@ -353,6 +567,24 @@ class App:
         self.monitor_frame.pack(fill="x", padx=8, pady=8)
         ttk.Button(monitor_box, text="刷新屏幕", command=self.refresh_monitors).pack(fill="x", padx=8, pady=(0, 8))
 
+        app_box = ttk.LabelFrame(right, text="监控应用")
+        app_box.pack(fill="x", pady=(10, 0))
+        self.window_canvas = Canvas(app_box, highlightthickness=0, height=118)
+        window_scroll = ttk.Scrollbar(app_box, orient="vertical", command=self.window_canvas.yview)
+        self.window_canvas.configure(yscrollcommand=window_scroll.set)
+        self.window_canvas.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
+        window_scroll.pack(side="right", fill="y", pady=8)
+        self.window_inner = ttk.Frame(self.window_canvas)
+        self.window_canvas_window = self.window_canvas.create_window((0, 0), window=self.window_inner, anchor="nw")
+        self.window_inner.bind("<Configure>", lambda _event: self.window_canvas.configure(scrollregion=self.window_canvas.bbox("all")))
+        self.window_canvas.bind("<Configure>", lambda event: self.window_canvas.itemconfigure(self.window_canvas_window, width=event.width))
+        ttk.Button(app_box, text="刷新应用", command=self.refresh_windows).pack(fill="x", padx=8, pady=(0, 8))
+
+        source_box = ttk.LabelFrame(right, text="已选来源")
+        source_box.pack(fill="x", pady=(10, 0))
+        self.source_frame = ttk.Frame(source_box)
+        self.source_frame.pack(fill="x", padx=8, pady=8)
+
         region_box = ttk.LabelFrame(right, text="区域")
         region_box.pack(fill="x", pady=10)
         for label, var in [("左", self.left), ("上", self.top), ("宽(空=全屏)", self.width), ("高(空=全屏)", self.height)]:
@@ -363,7 +595,7 @@ class App:
 
         match_box = ttk.LabelFrame(right, text="匹配")
         match_box.pack(fill="x")
-        for label, var in [("阈值", self.threshold), ("缩放", self.scales), ("间隔ms", self.interval_ms), ("同图冷却秒", self.cooldown), ("蜂鸣秒", self.beep_seconds), ("截图最多张", self.max_alerts)]:
+        for label, var in [("阈值", self.threshold), ("缩放", self.scales), ("间隔ms", self.interval_ms), ("同图冷却秒", self.cooldown), ("蜂鸣秒", self.beep_seconds), ("模板最多张", self.max_templates), ("截图最多张", self.max_alerts)]:
             row = ttk.Frame(match_box)
             row.pack(fill="x", padx=8, pady=3)
             ttk.Label(row, text=label, width=12).pack(side="left")
@@ -383,7 +615,13 @@ class App:
     def make_entry(self, parent, var):
         entry = ttk.Entry(parent, textvariable=var)
         entry.bind("<FocusIn>", lambda event: event.widget.after_idle(event.widget.icursor, "end"))
+        entry.bind("<Button-1>", self.focus_entry_end)
         return entry
+
+    def focus_entry_end(self, event):
+        event.widget.focus_set()
+        event.widget.after_idle(event.widget.icursor, "end")
+        return "break"
 
     def make_check(self, parent, var, label, command=None):
         return ttk.Checkbutton(parent, text=label, variable=var, command=command)
@@ -400,6 +638,35 @@ class App:
             text = f"{monitor['index']}: {monitor['width']}x{monitor['height']} ({monitor['left']},{monitor['top']})"
             self.make_check(self.monitor_frame, var, text).pack(anchor="w", pady=2)
         self.status.set(f"检测到 {len(monitors)} 个物理屏。")
+
+    def refresh_windows(self):
+        selected_titles = {info["title"] for hwnd, info in self.window_info.items() if self.window_vars.get(hwnd) and self.window_vars[hwnd].get()}
+        selected_titles.update(self.saved_window_titles)
+        for child in self.window_inner.winfo_children():
+            child.destroy()
+        self.window_vars.clear()
+        self.window_info.clear()
+        windows = list_app_windows()
+        for item in windows:
+            hwnd = item["hwnd"]
+            self.window_info[hwnd] = item
+            var = BooleanVar(value=item["title"] in selected_titles)
+            self.window_vars[hwnd] = var
+            text = f"{item['title']} ({item['width']}x{item['height']})"
+            self.make_check(self.window_inner, var, text).pack(anchor="w", pady=2)
+        if windows:
+            self.status.set(f"检测到 {len(windows)} 个可选择应用窗口。")
+
+    def handle_paste_hotkey(self, _event=None):
+        widget = self.root.focus_get()
+        if widget:
+            try:
+                if widget.winfo_class() in {"Entry", "TEntry", "Text", "TCombobox", "Spinbox", "TSpinbox"}:
+                    return None
+            except TclError:
+                pass
+        self.paste_images()
+        return "break"
 
     def add_files(self):
         paths = filedialog.askopenfilenames(filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp")])
@@ -428,14 +695,37 @@ class App:
             messagebox.showerror("截图失败", str(exc))
 
     def add_image(self, name, image):
-        path = save_template(image, name)
+        max_templates = parse_positive_int(self.max_templates.get(), "max_templates")
+        self.prune_targets(max_templates - 1)
+        path = save_template(image, self.current_profile, len(self.targets) + 1)
         thumb = save_thumb(image, path)
-        width, height = Image.open(path).size
+        with Image.open(path) as saved:
+            width, height = saved.size
         self.targets.append({"name": path.stem, "path": str(path), "thumb": str(thumb), "size": f"{width}x{height}", "enabled": True})
         self.selected_target = len(self.targets) - 1
         self.reload_target_list()
         self.save_current_profile()
         self.status.set(f"已添加 {len(self.targets)} 张模板。")
+
+    def prune_targets(self, keep_count):
+        keep_count = max(0, int(keep_count))
+        if len(self.targets) <= keep_count:
+            return 0
+        removed = self.targets[: len(self.targets) - keep_count]
+        self.targets = self.targets[-keep_count:] if keep_count else []
+        for target in removed:
+            for key, parent in (("path", DATA_DIR / "templates"), ("thumb", THUMBS_DIR)):
+                path = target.get(key)
+                if path and is_under(path, parent):
+                    try:
+                        Path(path).unlink(missing_ok=True)
+                    except TypeError:
+                        p = Path(path)
+                        if p.exists():
+                            p.unlink()
+                    except OSError:
+                        pass
+        return len(removed)
 
     def make_thumb(self, target):
         path = target.get("thumb") or target["path"]
@@ -471,6 +761,61 @@ class App:
         self.selected_target = None
         self.reload_target_list()
         self.save_current_profile()
+
+    def selected_windows(self):
+        out = []
+        for hwnd, var in self.window_vars.items():
+            if var.get() and hwnd in self.window_info:
+                title = self.window_info[hwnd]["title"]
+                out.append({"name": f"app-{safe_name(title)}", "title": title, "hwnd": hwnd})
+        return out
+
+    def refresh_source_previews(self):
+        try:
+            for child in self.source_frame.winfo_children():
+                child.destroy()
+            self.source_refs.clear()
+            sources = []
+            for monitor in self.selected_regions():
+                sources.append(("screen", monitor["name"], monitor))
+            for window in self.selected_windows():
+                sources.append(("window", window["title"], window))
+            if not sources:
+                ttk.Label(self.source_frame, text="未选择来源").pack(anchor="w")
+            for idx, (kind, name, source) in enumerate(sources[:8]):
+                frame = ttk.Frame(self.source_frame)
+                frame.grid(row=idx // 2, column=idx % 2, sticky="nw", padx=3, pady=3)
+                image = self.preview_image(kind, source)
+                if image:
+                    self.source_refs.append(image)
+                    Label(frame, image=image).pack()
+                ttk.Label(frame, text=name, width=16).pack()
+        finally:
+            try:
+                self.preview_job = self.root.after(1200, self.refresh_source_previews)
+            except TclError:
+                pass
+
+    def preview_image(self, kind, source):
+        try:
+            if kind == "window":
+                frame = capture_window(source["hwnd"])
+            else:
+                from mss import mss
+
+                with mss() as sct:
+                    monitors = [{"index": i, **m} for i, m in enumerate(sct.monitors)]
+                    region = config_regions({"regions": [source]}, monitors)[0]
+                    frame = capture_region(sct, region)
+            if frame is None:
+                return None
+            img = Image.fromarray(frame).convert("RGB")
+            img.thumbnail((120, 70))
+            canvas = Image.new("RGB", (120, 70), (245, 245, 245))
+            canvas.paste(img, ((120 - img.width) // 2, (70 - img.height) // 2))
+            return ImageTk.PhotoImage(canvas)
+        except Exception:
+            return None
 
     def reload_target_list(self):
         for child in self.gallery_inner.winfo_children():
@@ -556,6 +901,7 @@ class App:
         data = {
             "targets": self.targets,
             "monitors": [i for i, var in self.monitor_vars.items() if var.get()],
+            "windows": [item["title"] for item in self.selected_windows()],
             "region": {"left": self.left.get(), "top": self.top.get(), "width": self.width.get(), "height": self.height.get()},
             "match": {
                 "threshold": self.threshold.get(),
@@ -564,6 +910,7 @@ class App:
                 "cooldown": self.cooldown.get(),
                 "beep": self.beep.get(),
                 "beep_seconds": self.beep_seconds.get(),
+                "max_templates": self.max_templates.get(),
             },
         }
         write_json(self.profile_path(), data)
@@ -586,10 +933,14 @@ class App:
         self.cooldown.set(match.get("cooldown", 1.0))
         self.beep.set(match.get("beep", True))
         self.beep_seconds.set(match.get("beep_seconds", match.get("beep_count", 3)))
+        self.max_templates.set(match.get("max_templates", 100))
         selected_monitors = set(data.get("monitors", []))
         if selected_monitors:
             for i, var in self.monitor_vars.items():
                 var.set(i in selected_monitors)
+        self.saved_window_titles = list(data.get("windows", []))
+        if self.saved_window_titles:
+            self.refresh_windows()
         self.loading_profile = False
         self.reload_target_list()
         self.status.set(f"已载入配置 {number}。")
@@ -695,15 +1046,18 @@ class App:
         if not targets:
             raise ValueError("至少勾选一张要匹配的模板图片")
         regions = self.selected_regions()
-        if not regions:
-            raise ValueError("至少选择一个屏幕")
+        windows = self.selected_windows()
+        if not regions and not windows:
+            raise ValueError("至少选择一个屏幕或应用")
         threshold = float(self.threshold.get())
         scales = parse_scales(self.scales.get())
         beep_seconds = parse_positive_float(self.beep_seconds.get(), "beep_seconds")
+        parse_positive_int(self.max_templates.get(), "max_templates")
         max_alerts = parse_positive_int(self.max_alerts.get(), "max_alerts")
         return {
             "_base_dir": str(DATA_DIR),
             "regions": regions,
+            "windows": windows,
             "targets": [
                 {"name": t["name"], "kind": "template", "path": t["path"], "threshold": threshold, "scales": scales}
                 for t in targets
@@ -746,7 +1100,8 @@ class App:
         last_seen = {}
         with mss() as sct:
             monitors = [{"index": i, **m} for i, m in enumerate(sct.monitors)]
-            regions = config_regions(config, monitors)
+            regions = config_regions(config, monitors) if config.get("regions") else []
+            windows = config.get("windows", [])
             while not self.stop_event.is_set():
                 started = time.perf_counter()
                 hit_count = 0
@@ -755,8 +1110,15 @@ class App:
                     matches = detector.run(frame)
                     if matches:
                         hit_count += self.emit_alert(config, last_seen, region, frame, matches)
+                for window in windows:
+                    frame = capture_window(window["hwnd"])
+                    if frame is None:
+                        continue
+                    matches = detector.run(frame)
+                    if matches:
+                        hit_count += self.emit_alert(config, last_seen, window, frame, matches)
                 elapsed = time.perf_counter() - started
-                self.events.put(("tick", f"扫描 {len(regions)} 屏 / {len(config['targets'])} 图，用时 {elapsed * 1000:.0f} ms，命中 {hit_count}"))
+                self.events.put(("tick", f"扫描 {len(regions)} 屏 / {len(windows)} 应用 / {len(config['targets'])} 图，用时 {elapsed * 1000:.0f} ms，命中 {hit_count}"))
                 if once:
                     return
                 time.sleep(max(0.01, config["poll_interval_seconds"] - elapsed))
