@@ -235,8 +235,17 @@ class CoreTest(unittest.TestCase):
         app.redraw_checks = mock.Mock()
         app.reload_target_list = mock.Mock()
         app.restore_layout = mock.Mock()
+        app.mouse_button_down = mock.Mock(return_value=False)
         appmod.App.apply_scale(app)
         app.restore_layout.assert_not_called()
+
+    def test_apply_scale_waits_while_mouse_is_down(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.resize_job = None
+        app.mouse_button_down = mock.Mock(return_value=True)
+        appmod.App.apply_scale(app)
+        app.root.after.assert_called_once_with(120, app.apply_scale)
 
     def test_preview_height_tracks_source_aspect(self):
         app = object.__new__(appmod.App)
@@ -255,6 +264,7 @@ class CoreTest(unittest.TestCase):
         app.resize_active_until = 0
         app.layout_active_until = 0
         app.move_active_until = 0
+        app.mouse_button_down = mock.Mock(return_value=False)
         self.assertFalse(appmod.App.layout_busy(app))
         appmod.App.begin_layout_drag(app)
         self.assertTrue(appmod.App.layout_busy(app))
@@ -264,6 +274,27 @@ class CoreTest(unittest.TestCase):
         app.resize_active_until = 0
         app.move_active_until = appmod.time.time() + 1
         self.assertTrue(appmod.App.layout_busy(app))
+        app.move_active_until = 0
+        app.mouse_button_down.return_value = True
+        self.assertTrue(appmod.App.layout_busy(app))
+
+    def test_window_refresh_waits_while_layout_busy(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.layout_busy = mock.Mock(return_value=True)
+        app.refresh_windows = mock.Mock()
+        appmod.App.refresh_windows_loop(app)
+        app.refresh_windows.assert_not_called()
+        app.root.after.assert_called_once_with(2000, app.refresh_windows_loop)
+
+    def test_poll_events_waits_while_layout_busy(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.layout_busy = mock.Mock(return_value=True)
+        app.events = mock.Mock()
+        appmod.App.poll_events(app)
+        app.events.get_nowait.assert_not_called()
+        app.root.after.assert_called_once_with(100, app.poll_events)
 
     def test_horizontal_resize_stretches_left_pane_only(self):
         root = appmod.Tk()

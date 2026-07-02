@@ -63,6 +63,7 @@ PREVIEW_H = 150
 SCREEN_PREVIEW_SECONDS = 0.25
 MIN_SCAN_INTERVAL_MS = 120
 SOURCE_PREVIEW_SYNC_MS = 500
+VK_LBUTTON = 0x01
 
 
 def enable_dpi_awareness():
@@ -957,7 +958,16 @@ class App:
         self.capture_layout_ratios()
 
     def layout_busy(self):
-        return time.time() < max(self.resize_active_until, self.layout_active_until, self.move_active_until)
+        active_until = max(getattr(self, "resize_active_until", 0), getattr(self, "layout_active_until", 0), getattr(self, "move_active_until", 0))
+        return self.mouse_button_down() or time.time() < active_until
+
+    def mouse_button_down(self):
+        if os.name != "nt":
+            return False
+        try:
+            return bool(ctypes.windll.user32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+        except Exception:
+            return False
 
     def refresh_monitors(self):
         selected = {i for i, var in self.monitor_vars.items() if var.get()}
@@ -985,7 +995,8 @@ class App:
             self.status.set(f"检测到 {len(self.window_choices)} 个可选择应用窗口。")
 
     def refresh_windows_loop(self):
-        self.refresh_windows()
+        if not self.layout_busy():
+            self.refresh_windows()
         self.window_refresh_job = self.root.after(2000, self.refresh_windows_loop)
 
     def app_key(self, app):
@@ -1535,6 +1546,9 @@ class App:
 
     def apply_scale(self):
         self.resize_job = None
+        if self.mouse_button_down():
+            self.resize_job = self.root.after(120, self.apply_scale)
+            return
         width = max(1, self.root.winfo_width())
         height = max(1, self.root.winfo_height())
         if (width, height) != self.last_root_size:
@@ -1714,6 +1728,9 @@ class App:
         threading.Thread(target=beep_for, args=(seconds, lambda: self.beep_volume_level), daemon=True).start()
 
     def poll_events(self):
+        if self.layout_busy():
+            self.root.after(100, self.poll_events)
+            return
         while True:
             try:
                 kind, message = self.events.get_nowait()
