@@ -199,19 +199,19 @@ class CoreTest(unittest.TestCase):
         app.root = mock.Mock()
         app.last_root_size = (980, 680)
         app.resize_job = None
+        app.move_active_until = 0
         event = type("Event", (), {"widget": app.root, "width": 980, "height": 680})()
         appmod.App.on_resize(app, event)
         app.root.after.assert_not_called()
+        self.assertTrue(app.move_active_until > 0)
 
     def test_vertical_resize_does_not_reset_horizontal_panes(self):
         app = object.__new__(appmod.App)
         app.root = mock.Mock()
         app.last_root_size = (980, 680)
-        app.resize_width_changed = False
         app.resize_job = None
         event = type("Event", (), {"widget": app.root, "width": 980, "height": 720})()
         appmod.App.on_resize(app, event)
-        self.assertFalse(app.resize_width_changed)
 
         app.left_ratio = 0.5
         app.main_pane = mock.Mock()
@@ -221,6 +221,23 @@ class CoreTest(unittest.TestCase):
         app.main_pane.sash_place.assert_not_called()
         app.left_pane.sash_place.assert_called_once_with(0, 0, 360)
 
+    def test_apply_scale_does_not_reset_panes_on_outer_resize(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.root.winfo_width.return_value = 1200
+        app.root.winfo_height.return_value = 700
+        app.last_root_size = (1200, 700)
+        app.resize_job = object()
+        app.last_scale = 1.0
+        app.fonts = {}
+        app.base_font_sizes = {}
+        app.style = mock.Mock()
+        app.redraw_checks = mock.Mock()
+        app.reload_target_list = mock.Mock()
+        app.restore_layout = mock.Mock()
+        appmod.App.apply_scale(app)
+        app.restore_layout.assert_not_called()
+
     def test_preview_height_tracks_source_aspect(self):
         app = object.__new__(appmod.App)
         source = {"source": {"width": 1920, "height": 1080}}
@@ -229,7 +246,7 @@ class CoreTest(unittest.TestCase):
     def test_side_panes_stay_equal_and_bounded(self):
         app = object.__new__(appmod.App)
         app.right_ratio = 0.5
-        self.assertEqual(appmod.App.side_pane_width(app, 2388), 360)
+        self.assertEqual(appmod.App.side_pane_width(app, 2388), 955)
         app.right_ratio = 0.16
         self.assertEqual(appmod.App.side_pane_width(app, 1453), 260)
 
@@ -237,12 +254,78 @@ class CoreTest(unittest.TestCase):
         app = object.__new__(appmod.App)
         app.resize_active_until = 0
         app.layout_active_until = 0
+        app.move_active_until = 0
         self.assertFalse(appmod.App.layout_busy(app))
         appmod.App.begin_layout_drag(app)
         self.assertTrue(appmod.App.layout_busy(app))
         app.layout_active_until = 0
         app.resize_active_until = appmod.time.time() + 1
         self.assertTrue(appmod.App.layout_busy(app))
+        app.resize_active_until = 0
+        app.move_active_until = appmod.time.time() + 1
+        self.assertTrue(appmod.App.layout_busy(app))
+
+    def test_horizontal_resize_stretches_left_pane_only(self):
+        root = appmod.Tk()
+        root.geometry("1000x700")
+        try:
+            app = object.__new__(appmod.App)
+            app.root = root
+            app.layout = {}
+            app.right_ratio = 0.16
+            app.left_ratio = 0.58
+            app.window_choices = []
+            app.window_info = {}
+            app.window_choice = appmod.StringVar(value="选择应用...")
+            app.selected_apps = []
+            app.source_widgets = {}
+            app.preview_lock = mock.Mock()
+            app.preview_sources = []
+            app.preview_frames = {}
+            app.monitor_vars = {}
+            app.monitor_info = {}
+            app.profile = appmod.IntVar(value=1)
+            app.startup_enabled = appmod.BooleanVar(value=False)
+            app.threshold = appmod.DoubleVar(value=0.9)
+            app.scales = appmod.StringVar(value="1.0")
+            app.interval_ms = appmod.IntVar(value=250)
+            app.cooldown = appmod.DoubleVar(value=1.0)
+            app.beep_seconds = appmod.DoubleVar(value=3.0)
+            app.beep_volume = appmod.IntVar(value=100)
+            app.max_templates = appmod.IntVar(value=100)
+            app.max_alerts = appmod.IntVar(value=50)
+            app.beep = appmod.BooleanVar(value=True)
+            app.left = appmod.StringVar(value="0")
+            app.top = appmod.StringVar(value="0")
+            app.width = appmod.StringVar(value="")
+            app.height = appmod.StringVar(value="")
+            app.status = appmod.StringVar(value="")
+            app.fonts = {name: appmod.tkfont.nametofont(name) for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont")}
+            app.style = appmod.ttk.Style()
+            app.check_widgets = []
+            app.thumb_w = 128
+            app.thumb_h = 88
+            app.last_scale = 1.0
+            app.targets = []
+            app.target_vars = []
+            app.thumb_refs = []
+            app.thumb_cache = {}
+            app.selected_target = None
+            app._build()
+            root.update_idletasks()
+            app.main_pane.sash_place(0, 500, 0)
+            app.main_pane.sash_place(1, 800, 0)
+            root.update_idletasks()
+            before_right = app.main_pane.sash_coord(1)[0] - app.main_pane.sash_coord(0)[0]
+            before_preview = app.main_pane.winfo_width() - app.main_pane.sash_coord(1)[0]
+            root.geometry("1200x700")
+            root.update_idletasks()
+            after_right = app.main_pane.sash_coord(1)[0] - app.main_pane.sash_coord(0)[0]
+            after_preview = app.main_pane.winfo_width() - app.main_pane.sash_coord(1)[0]
+            self.assertAlmostEqual(after_right, before_right, delta=8)
+            self.assertAlmostEqual(after_preview, before_preview, delta=8)
+        finally:
+            root.destroy()
 
     def test_show_window_keeps_existing_tray_icon(self):
         root = appmod.Tk()

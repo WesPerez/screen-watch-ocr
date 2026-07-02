@@ -637,7 +637,7 @@ class App:
         self.state = load_json(STATE_PATH, {"last_profile": 1, "layout": {}})
         self.layout = self.state.get("layout", {})
         self.main_ratio = float(self.layout.get("main_ratio", 0.72))
-        self.right_ratio = min(0.18, max(0.12, float(self.layout.get("right_ratio", 0.16))))
+        self.right_ratio = min(0.4, max(0.12, float(self.layout.get("right_ratio", 0.16))))
         self.left_ratio = float(self.layout.get("left_ratio", 0.58))
         self.root.geometry(self.layout.get("geometry", "980x680"))
         self.root.minsize(820, 600)
@@ -655,7 +655,7 @@ class App:
         self.resize_job = None
         self.last_root_size = None
         self.resize_active_until = 0
-        self.resize_width_changed = True
+        self.move_active_until = 0
         self.layout_active_until = 0
         self.layout_restore_job = None
         self.monitor_vars = {}
@@ -731,9 +731,9 @@ class App:
         self.right_canvas.bind("<Configure>", lambda event: self.right_canvas.itemconfigure(right_window, width=event.width))
         self.right_canvas.bind("<MouseWheel>", self.scroll_right)
         right.bind("<MouseWheel>", self.scroll_right)
-        self.main_pane.add(left, minsize=360)
-        self.main_pane.add(right_outer, minsize=260)
-        self.main_pane.add(preview_outer, minsize=260)
+        self.main_pane.add(left, minsize=360, stretch="always")
+        self.main_pane.add(right_outer, minsize=260, stretch="never")
+        self.main_pane.add(preview_outer, minsize=260, stretch="never")
         self.main_pane.bind("<ButtonPress-1>", self.begin_layout_drag)
         self.main_pane.bind("<B1-Motion>", self.mark_layout_drag)
         self.main_pane.bind("<ButtonRelease-1>", self.end_layout_drag)
@@ -957,7 +957,7 @@ class App:
         self.capture_layout_ratios()
 
     def layout_busy(self):
-        return time.time() < max(self.resize_active_until, self.layout_active_until)
+        return time.time() < max(self.resize_active_until, self.layout_active_until, self.move_active_until)
 
     def refresh_monitors(self):
         selected = {i for i, var in self.monitor_vars.items() if var.get()}
@@ -1356,16 +1356,19 @@ class App:
         try:
             root_w = max(1, self.root.winfo_width())
             root_h = max(1, self.root.winfo_height())
-            self.main_ratio = min(0.85, max(0.45, self.main_pane.sash_coord(0)[0] / root_w))
-            self.right_ratio = min(0.18, max(0.12, (self.main_pane.sash_coord(1)[0] - self.main_pane.sash_coord(0)[0]) / root_w))
+            self.main_ratio = min(0.85, max(0.25, self.main_pane.sash_coord(0)[0] / root_w))
+            self.right_ratio = min(0.4, max(0.12, (self.main_pane.sash_coord(1)[0] - self.main_pane.sash_coord(0)[0]) / root_w))
             self.left_ratio = min(0.8, max(0.25, self.left_pane.sash_coord(0)[1] / root_h))
         except Exception:
             pass
 
     def side_pane_width(self, width):
-        max_side = max(180, min(360, (int(width) - 360) // 2))
+        ratio = min(0.4, max(0.12, self.right_ratio))
+        max_side = max(180, (int(width) - 360) // 2)
         min_side = min(260, max_side)
-        preferred = int(width * min(0.18, max(0.12, self.right_ratio)))
+        preferred = int(width * ratio)
+        if ratio <= 0.18:
+            preferred = min(360, preferred)
         return max(min_side, min(max_side, preferred))
 
     def restore_layout(self, horizontal=True, vertical=True):
@@ -1522,10 +1525,9 @@ class App:
             return
         size = (event.width, event.height)
         if size == self.last_root_size:
+            self.move_active_until = time.time() + 0.3
             return
-        old_size = self.last_root_size
         self.last_root_size = size
-        self.resize_width_changed = self.resize_width_changed or old_size is None or event.width != old_size[0]
         self.resize_active_until = time.time() + 0.3
         if self.resize_job:
             self.root.after_cancel(self.resize_job)
@@ -1537,11 +1539,8 @@ class App:
         height = max(1, self.root.winfo_height())
         if (width, height) != self.last_root_size:
             return
-        width_changed = self.resize_width_changed
-        self.resize_width_changed = False
         scale = max(0.8, min(1.8, ((width * height) / (980 * 680)) ** 0.5))
         if abs(scale - self.last_scale) < 0.08:
-            self.restore_layout(horizontal=width_changed)
             return
         self.last_scale = scale
         for name, font in self.fonts.items():
@@ -1551,7 +1550,6 @@ class App:
         self.thumb_h = int(88 * scale)
         self.redraw_checks()
         self.reload_target_list()
-        self.restore_layout(horizontal=width_changed)
 
     def selected_regions(self):
         return [self.region_for(i) for i, var in self.monitor_vars.items() if var.get()]
