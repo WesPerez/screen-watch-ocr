@@ -5,11 +5,116 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
+
+cv2.setUseOptimized(True)
+cv2.setNumThreads(1)
+
+MAX_SCALE_COUNT = 120
+COARSE_AREA = 2560 * 1440
+QUARTER_AREA = 3840 * 2160
+COARSE_CANDIDATES = 3
+REFINE_MARGIN = 16
+TEMPLATE_WORKERS = 8
+
+
+def parse_scales(value):
+    values = []
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",") if part.strip()]
+    elif isinstance(value, (int, float)):
+        parts = [str(value)]
+    else:
+        parts = list(value)
+
+    for part in parts:
+        if not isinstance(part, str):
+            scale = float(part)
+            if scale <= 0:
+                raise ValueError("scale must be > 0")
+            values.append(scale)
+            continue
+
+        token = part.strip()
+        if "-" not in token:
+            scale = float(token)
+            if scale <= 0:
+                raise ValueError("scale must be > 0")
+            values.append(scale)
+            continue
+
+        if ":" not in token:
+            raise ValueError(f"scale range {token!r} needs a step, for example 0.5-2.0:0.1")
+        span, step_text = token.split(":", 1)
+        start_text, end_text = span.split("-", 1)
+        start, end = float(start_text), float(end_text)
+        if start <= 0 or end <= 0:
+            raise ValueError("scale range values must be > 0")
+        values.extend(_scale_range(start, end, step_text.strip()))
+
+    out = []
+    seen = set()
+    for value in values:
+        key = round(float(value), 6)
+        if key <= 0:
+            raise ValueError("scale must be > 0")
+        if key not in seen:
+            out.append(key)
+            seen.add(key)
+        if len(out) > MAX_SCALE_COUNT:
+            raise ValueError(f"too many scales; keep it <= {MAX_SCALE_COUNT}")
+    if not out:
+        raise ValueError("scales is empty")
+    return out
+
+
+def _scale_range(start, end, step_text):
+    percent = step_text.endswith("%")
+    step = float(step_text[:-1] if percent else step_text)
+    if step <= 0:
+        raise ValueError("scale range step must be > 0")
+
+    values = []
+    if percent:
+        factor = 1 + step / 100
+        current = start
+        if start <= end:
+            while current <= end * 1.0000001:
+                values.append(current)
+                if len(values) > MAX_SCALE_COUNT:
+                    raise ValueError(f"too many scales; keep it <= {MAX_SCALE_COUNT}")
+                current *= factor
+        else:
+            while current >= end / 1.0000001:
+                values.append(current)
+                if len(values) > MAX_SCALE_COUNT:
+                    raise ValueError(f"too many scales; keep it <= {MAX_SCALE_COUNT}")
+                current /= factor
+    else:
+        direction = 1 if end >= start else -1
+        current = start
+        step *= direction
+        if direction > 0:
+            while current <= end + abs(step) / 1_000_000:
+                values.append(current)
+                if len(values) > MAX_SCALE_COUNT:
+                    raise ValueError(f"too many scales; keep it <= {MAX_SCALE_COUNT}")
+                current += step
+        else:
+            while current >= end - abs(step) / 1_000_000:
+                values.append(current)
+                if len(values) > MAX_SCALE_COUNT:
+                    raise ValueError(f"too many scales; keep it <= {MAX_SCALE_COUNT}")
+                current += step
+
+    if values and abs(values[-1] - end) > 1e-6:
+        values.append(end)
+    return values
 
 
 def load_config(path):
@@ -122,14 +227,19 @@ class Detector:
                 if image is None:
                     raise ValueError(f"cannot read template {path}")
                 scaled = []
-                for scale in target.get("scales", [1.0]):
+                seen_sizes = set()
+                for scale in parse_scales(target.get("scales", [1.0])):
                     if float(scale) == 1.0:
                         item = image
                     else:
                         w = max(1, int(image.shape[1] * float(scale)))
                         h = max(1, int(image.shape[0] * float(scale)))
                         item = cv2.resize(image, (w, h), interpolation=cv2.INTER_AREA)
-                    scaled.append((item, float(np.std(item)) < 1))
+                    size = item.shape[:2]
+                    if size in seen_sizes:
+                        continue
+                    seen_sizes.add(size)
+                    scaled.append({"image": item, "flat": float(np.std(item)) < 1, "scale": scale, "coarse": self._coarse_templates(item)})
                 self.templates[target["name"]] = scaled
 
     def _path(self, value):
@@ -137,26 +247,34 @@ class Detector:
         return path if path.is_absolute() else self.base_dir / path
 
     def run(self, frame):
-        matches = []
+        hits = [None] * len(self.targets)
         gray = None
         ocr_rows = None
-        for target in self.targets:
+        template_jobs = []
+        for index, target in enumerate(self.targets):
             kind = target.get("kind")
             if kind == "pixel":
-                hit = self._pixel(frame, target)
+                hits[index] = self._pixel(frame, target)
             elif kind == "template":
                 if gray is None:
                     gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-                hit = self._template(gray, target)
+                template_jobs.append((index, target))
             elif kind == "ocr_text":
                 if ocr_rows is None:
                     ocr_rows = self.ocr.read(frame)
-                hit = self._ocr(ocr_rows, target)
+                hits[index] = self._ocr(ocr_rows, target)
             else:
                 raise ValueError(f"unknown target kind {kind!r}")
-            if hit:
-                matches.append(hit)
-        return matches
+        if template_jobs:
+            frames = self._frames_for(gray, template_jobs)
+            if len(template_jobs) > 1:
+                with ThreadPoolExecutor(max_workers=min(TEMPLATE_WORKERS, len(template_jobs))) as pool:
+                    for index, hit in pool.map(lambda job: (job[0], self._template(frames, job[1])), template_jobs):
+                        hits[index] = hit
+            else:
+                index, target = template_jobs[0]
+                hits[index] = self._template(frames, target)
+        return [hit for hit in hits if hit]
 
     def _pixel(self, frame, target):
         x, y = int(target["x"]), int(target["y"])
@@ -169,29 +287,123 @@ class Detector:
             return {"target": target["name"], "kind": "pixel", "score": 1 - dist / 255, "box": [x - 4, y - 4, x + 4, y + 4]}
         return None
 
-    def _template(self, gray, target):
+    def _template(self, frames, target):
         threshold = float(target.get("threshold", 0.9))
         best = None
-        for scaled, is_flat in self.templates[target["name"]]:
+        gray = frames[1.0]
+        for item in self.templates[target["name"]]:
+            scaled = item["image"]
             if scaled.shape[0] > gray.shape[0] or scaled.shape[1] > gray.shape[1]:
                 continue
-            if is_flat:
-                result = cv2.matchTemplate(gray, scaled, cv2.TM_SQDIFF_NORMED)
-                min_val, _, min_loc, _ = cv2.minMaxLoc(result)
-                score, loc = 1 - float(min_val), min_loc
+            factor = self._frame_scale(gray, scaled, item)
+            if factor == 1.0:
+                score, loc = self._match_one(gray, scaled, item["flat"])
             else:
-                result = cv2.matchTemplate(gray, scaled, cv2.TM_CCOEFF_NORMED)
-                _, max_val, _, max_loc = cv2.minMaxLoc(result)
-                score, loc = float(max_val), max_loc
+                score, loc = self._match_coarse(frames, item, factor)
             if best is None or score > best["score"]:
                 x, y = loc
                 best = {
                     "target": target["name"],
                     "kind": "template",
                     "score": score,
+                    "scale": item["scale"],
                     "box": [x, y, x + scaled.shape[1], y + scaled.shape[0]],
                 }
         return best if best and best["score"] >= threshold else None
+
+    def _coarse_templates(self, image):
+        out = {}
+        original_flat = float(np.std(image)) < 1
+        for factor in (0.5, 0.25, 0.125):
+            w = max(1, int(image.shape[1] * factor))
+            h = max(1, int(image.shape[0] * factor))
+            min_dim = 3 if factor == 0.5 else 4 if factor == 0.25 else 8
+            if min(w, h) >= min_dim:
+                coarse = cv2.resize(image, (w, h), interpolation=cv2.INTER_AREA)
+                if original_flat or float(np.std(coarse)) >= 1:
+                    out[factor] = coarse
+        return out
+
+    def _frame_scale(self, gray, scaled, item):
+        area = gray.shape[0] * gray.shape[1]
+        if area >= QUARTER_AREA and 0.25 in item["coarse"]:
+            return 0.25
+        if area >= COARSE_AREA and 0.5 in item["coarse"]:
+            return 0.5
+        return 1.0
+
+    def _frames_for(self, gray, template_jobs):
+        frames = {1.0: gray}
+        factors = set()
+        for _index, target in template_jobs:
+            for item in self.templates[target["name"]]:
+                factors.add(self._frame_scale(gray, item["image"], item))
+        for factor in sorted(factors):
+            if factor != 1.0:
+                frames[factor] = cv2.resize(gray, (max(1, int(gray.shape[1] * factor)), max(1, int(gray.shape[0] * factor))), interpolation=cv2.INTER_AREA)
+        return frames
+
+    def _scaled_frame(self, frames, factor):
+        if factor not in frames:
+            gray = frames[1.0]
+            frames[factor] = cv2.resize(gray, (max(1, int(gray.shape[1] * factor)), max(1, int(gray.shape[0] * factor))), interpolation=cv2.INTER_AREA)
+        return frames[factor]
+
+    def _match_coarse(self, frames, item, factor):
+        coarse_gray = self._scaled_frame(frames, factor)
+        coarse_template = item["coarse"][factor]
+        if coarse_template.shape[0] > coarse_gray.shape[0] or coarse_template.shape[1] > coarse_gray.shape[1]:
+            return -1.0, (0, 0)
+        result = self._match_result(coarse_gray, coarse_template, item["flat"])
+        best_score, best_loc = -1.0, (0, 0)
+        for loc in self._candidate_locs(result, item["flat"], coarse_template.shape):
+            score, hit = self._refine(frames[1.0], item["image"], item["flat"], loc, factor)
+            if score > best_score:
+                best_score, best_loc = score, hit
+        return best_score, best_loc
+
+    def _refine(self, gray, template, is_flat, coarse_loc, factor):
+        x = int(round(coarse_loc[0] / factor))
+        y = int(round(coarse_loc[1] / factor))
+        margin = max(REFINE_MARGIN, int(max(template.shape[:2]) * 0.25))
+        x1 = max(0, x - margin)
+        y1 = max(0, y - margin)
+        x2 = min(gray.shape[1], x + template.shape[1] + margin)
+        y2 = min(gray.shape[0], y + template.shape[0] + margin)
+        patch = gray[y1:y2, x1:x2]
+        if template.shape[0] > patch.shape[0] or template.shape[1] > patch.shape[1]:
+            return -1.0, (x, y)
+        score, loc = self._match_one(patch, template, is_flat)
+        return score, (x1 + loc[0], y1 + loc[1])
+
+    def _match_one(self, gray, template, is_flat):
+        result = self._match_result(gray, template, is_flat)
+        if is_flat:
+            min_val, _, min_loc, _ = cv2.minMaxLoc(result)
+            return 1 - float(min_val), min_loc
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+        return float(max_val), max_loc
+
+    def _match_result(self, gray, template, is_flat):
+        method = cv2.TM_SQDIFF_NORMED if is_flat else cv2.TM_CCOEFF_NORMED
+        return cv2.matchTemplate(gray, template, method)
+
+    def _candidate_locs(self, result, is_flat, template_shape):
+        work = result.copy()
+        locs = []
+        for _ in range(COARSE_CANDIDATES):
+            min_val, _, min_loc, max_loc = cv2.minMaxLoc(work)
+            loc = min_loc if is_flat else max_loc
+            locs.append(loc)
+            radius = max(2, min(template_shape[:2]) // 2)
+            x1 = max(0, loc[0] - radius)
+            y1 = max(0, loc[1] - radius)
+            x2 = min(work.shape[1], loc[0] + radius + 1)
+            y2 = min(work.shape[0], loc[1] + radius + 1)
+            work[y1:y2, x1:x2] = 2 if is_flat else -2
+            if is_flat and min_val >= 1:
+                break
+        return locs
 
     def _ocr(self, rows, target):
         needle = str(target["text"])

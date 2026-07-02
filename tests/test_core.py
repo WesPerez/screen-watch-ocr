@@ -9,7 +9,7 @@ from PIL import Image
 
 import screen_watch.app as appmod
 from screen_watch.app import app_from_legacy, beep_wave, black_fraction, crop_black_padding, mostly_black, normalize_profile_file, normalize_target_names, parse_positive_float, parse_positive_int, parse_scales, parse_volume, prune_alerts, scan_interval_ms, template_name, window_key
-from screen_watch.core import self_test
+from screen_watch.core import Detector, self_test
 
 
 class CoreTest(unittest.TestCase):
@@ -20,6 +20,89 @@ class CoreTest(unittest.TestCase):
 
     def test_parse_scales(self):
         self.assertEqual(parse_scales("1, 0.9,1.1"), [1.0, 0.9, 1.1])
+        self.assertEqual(parse_scales("0.5-0.7:0.1,1"), [0.5, 0.6, 0.7, 1.0])
+        self.assertEqual(parse_scales("0.1-0.13:10%"), [0.1, 0.11, 0.121, 0.13])
+        with self.assertRaises(ValueError):
+            parse_scales("0.5-2.0")
+        with self.assertRaises(ValueError):
+            parse_scales("0.1-2.0:0.001")
+
+    def test_detector_matches_scaled_template_from_range(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            template = np.zeros((30, 40, 3), dtype=np.uint8)
+            template[4:26, 6:34] = [30, 160, 240]
+            template[10:20, 14:26] = [250, 230, 20]
+            path = base / "target.png"
+            Image.fromarray(template).save(path)
+
+            scaled = appmod.cv2.resize(appmod.cv2.imread(str(path), appmod.cv2.IMREAD_GRAYSCALE), (52, 39), interpolation=appmod.cv2.INTER_AREA)
+            frame = np.zeros((120, 160, 3), dtype=np.uint8)
+            frame[50:89, 70:122] = appmod.cv2.cvtColor(scaled, appmod.cv2.COLOR_GRAY2RGB)
+            detector = Detector({"_base_dir": str(base), "targets": [{"name": "target", "kind": "template", "path": str(path), "threshold": 0.99, "scales": "1.0-1.5:0.1"}]})
+            matches = detector.run(frame)
+            self.assertEqual(matches[0]["target"], "target")
+            self.assertEqual(matches[0]["box"], [70, 50, 122, 89])
+            self.assertEqual(matches[0]["scale"], 1.3)
+
+    def test_detector_matches_template_on_large_frame_fast_path(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            rng = np.random.default_rng(1)
+            template = rng.integers(0, 256, (80, 80, 3), dtype=np.uint8)
+            path = base / "target.png"
+            Image.fromarray(template).save(path)
+
+            frame = np.zeros((2160, 3840, 3), dtype=np.uint8)
+            frame[1700:1780, 3000:3080] = template
+            detector = Detector({"_base_dir": str(base), "targets": [{"name": "target", "kind": "template", "path": str(path), "threshold": 0.99, "scales": [1.0]}]})
+            matches = detector.run(frame)
+            self.assertEqual(matches[0]["box"], [3000, 1700, 3080, 1780])
+
+    def test_detector_large_frame_does_not_skip_unaligned_templates(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            rng = np.random.default_rng(2)
+            frame = np.zeros((2160, 3840, 3), dtype=np.uint8)
+            targets = []
+            expected = {}
+            positions = [(780, 80), (2180, 80), (80, 530), (780, 530), (2180, 530), (80, 980)]
+            for index, (x, y) in enumerate(positions):
+                template = rng.integers(0, 256, (80, 80, 3), dtype=np.uint8)
+                template[8:32, 9:33] = [(40 + index * 9) % 256, 230, 60]
+                path = base / f"target-{index}.png"
+                Image.fromarray(template).save(path)
+                frame[y : y + 80, x : x + 80] = template
+                name = f"target-{index}"
+                expected[name] = [x, y, x + 80, y + 80]
+                targets.append({"name": name, "kind": "template", "path": str(path), "threshold": 0.99, "scales": [1.0]})
+
+            detector = Detector({"_base_dir": str(base), "targets": targets})
+            matches = detector.run(frame)
+            boxes = {match["target"]: match["box"] for match in matches}
+            self.assertEqual(boxes, expected)
+
+    def test_detector_does_not_miss_when_coarse_template_loses_detail(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            pattern = np.indices((80, 80)).sum(axis=0) % 2
+            template = np.where(pattern[..., None], 255, 0).astype(np.uint8).repeat(3, axis=2)
+            path = base / "target.png"
+            Image.fromarray(template).save(path)
+
+            frame = np.zeros((2160, 3840, 3), dtype=np.uint8)
+            frame[1000:1080, 1000:1080] = template
+            detector = Detector({"_base_dir": str(base), "targets": [{"name": "target", "kind": "template", "path": str(path), "threshold": 0.99, "scales": [1.0]}]})
+            matches = detector.run(frame)
+            self.assertEqual(matches[0]["box"], [1000, 1000, 1080, 1080])
 
     def test_parse_positive_int(self):
         self.assertEqual(parse_positive_int("50", "beep_count"), 50)
@@ -69,6 +152,18 @@ class CoreTest(unittest.TestCase):
         finally:
             appmod.capture_window, appmod.window_rect = old_capture, old_rect
 
+    def test_window_capture_caches_visible_mode_after_black_printwindow(self):
+        import numpy as np
+
+        visible = np.full((2, 2, 3), 80, dtype=np.uint8)
+        cache = {}
+        with mock.patch.object(appmod, "capture_window", return_value=np.zeros((2, 2, 3), dtype=np.uint8)) as slow, mock.patch.object(appmod, "capture_window_visible", return_value=visible) as fast:
+            self.assertIs(appmod.capture_window_frame(object(), 123, cache), visible)
+            self.assertEqual(cache, {123: "visible"})
+            self.assertIs(appmod.capture_window_frame(object(), 123, cache), visible)
+            slow.assert_called_once()
+            self.assertEqual(fast.call_count, 2)
+
     def test_window_capture_crops_printwindow_black_padding_before_visible_fallback(self):
         import numpy as np
 
@@ -114,6 +209,12 @@ class CoreTest(unittest.TestCase):
         app.root.after.assert_called_once_with(appmod.DWM_PREVIEW_SYNC_MS, app.sync_dwm_previews_loop)
         self.assertEqual(app.dwm_sync_job, "job")
 
+    def test_dwm_preview_falls_back_when_widget_not_visible_yet(self):
+        app = object.__new__(appmod.App)
+        app.dwm_thumbs = {}
+        app.visible_preview_rect = mock.Mock(return_value=None)
+        self.assertFalse(appmod.App.sync_dwm_preview(app, "app:x", object(), 222))
+
     def test_dwm_sync_loop_repeats_only_while_layout_busy(self):
         app = object.__new__(appmod.App)
         app.dwm_sync_job = "job"
@@ -135,12 +236,111 @@ class CoreTest(unittest.TestCase):
             unregister.assert_called_once_with(thumb)
             self.assertEqual(app.dwm_thumbs, {})
 
+    def test_hide_to_tray_unregisters_dwm_preview_before_withdraw(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.ensure_tray_icon = mock.Mock(return_value=True)
+        app.disable_source_previews = mock.Mock()
+        app.status = mock.Mock()
+        appmod.App.hide_to_tray(app)
+        app.disable_source_previews.assert_called_once()
+        app.root.withdraw.assert_called_once()
+
+    def test_hide_to_tray_reenables_previews_when_tray_unavailable(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.ensure_tray_icon = mock.Mock(return_value=False)
+        app.disable_source_previews = mock.Mock()
+        app.enable_source_previews = mock.Mock()
+        app.status = mock.Mock()
+        appmod.App.hide_to_tray(app)
+        app.enable_source_previews.assert_called_once_with(250)
+        app.status.set.assert_not_called()
+
+    def test_screen_preview_captures_real_frame(self):
+        import numpy as np
+
+        class Shot:
+            width, height = 2, 2
+            rgb = bytes([10, 20, 30] * 4)
+
+        class Sct:
+            monitors = [{}, {"left": 0, "top": 0, "width": 2, "height": 2}]
+
+            def grab(self, box):
+                self.box = box
+                return Shot()
+
+        app = object.__new__(appmod.App)
+        source = {"available": True, "kind": "screen", "source": {"monitor": 1, "left": 0, "top": 0, "width": 2, "height": 2}}
+        sct = Sct()
+        frame = appmod.App.capture_preview_frame(app, sct, source)
+        self.assertFalse(mostly_black(frame))
+        self.assertEqual(frame.tolist(), np.full((2, 2, 3), [10, 20, 30], dtype=np.uint8).tolist())
+
+    def test_screen_preview_frame_is_reused_until_source_changes(self):
+        app = object.__new__(appmod.App)
+        app.preview_signatures = {"screen:monitor-2": ("screen", 2, 3840, 0, 3840, 2160)}
+        app.preview_frames = {"screen:monitor-2": object()}
+        source = {"key": "screen:monitor-2", "kind": "screen", "signature": ("screen", 2, 3840, 0, 3840, 2160)}
+        self.assertTrue(appmod.App.preview_frame_current(app, source))
+        source["signature"] = ("screen", 2, 3840, 0, 100, 100)
+        self.assertFalse(appmod.App.preview_frame_current(app, source))
+
+    def test_refresh_source_previews_gives_worker_signed_sources(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.preview_job = None
+        app.source_previews_enabled = True
+        app.layout_busy = mock.Mock(return_value=False)
+        app.selected_regions = mock.Mock(return_value=[{"name": "monitor-2", "monitor": 2}])
+        app.monitor_info = {2: {"left": 3840, "top": 0, "width": 3840, "height": 2160}}
+        app.selected_apps = []
+        app.window_info = {}
+        app.preview_sources = []
+        app.preview_frames = {}
+        app.preview_signatures = {}
+        app.preview_lock = mock.MagicMock()
+        app.source_canvas = mock.Mock()
+        app.source_canvas.winfo_width.return_value = 400
+        app.source_frame = mock.Mock()
+        app.source_widgets = {
+            "screen:monitor-2": {
+                "frame": mock.Mock(),
+                "area": mock.Mock(),
+                "image": mock.Mock(),
+                "name": mock.Mock(),
+            }
+        }
+        app.dwm_thumbs = {}
+        app.ensure_dwm_sync_loop = mock.Mock()
+        app.placeholder_image = mock.Mock(return_value="photo")
+
+        appmod.App.refresh_source_previews(app)
+
+        self.assertEqual(app.preview_sources[0]["signature"], ("screen", 2, 3840, 0, 3840, 2160))
+        app.root.after.assert_called_once_with(appmod.SOURCE_PREVIEW_SYNC_MS, app.refresh_source_previews)
+
     def test_refresh_source_previews_skips_full_rebuild_while_dragging(self):
         app = object.__new__(appmod.App)
         app.root = mock.Mock()
         app.preview_job = None
+        app.source_previews_enabled = True
         app.layout_busy = mock.Mock(return_value=True)
         app.source_widgets = {"app:x": {"frame": mock.Mock()}}
+        app.ensure_dwm_sync_loop = mock.Mock()
+        app.selected_regions = mock.Mock()
+        appmod.App.refresh_source_previews(app)
+        app.selected_regions.assert_not_called()
+        app.root.after.assert_called_once_with(appmod.SOURCE_PREVIEW_SYNC_MS, app.refresh_source_previews)
+
+    def test_refresh_source_previews_waits_while_startup_layout_is_busy(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.preview_job = None
+        app.source_previews_enabled = True
+        app.layout_busy = mock.Mock(return_value=True)
+        app.source_widgets = {}
         app.ensure_dwm_sync_loop = mock.Mock()
         app.selected_regions = mock.Mock()
         appmod.App.refresh_source_previews(app)
@@ -150,12 +350,24 @@ class CoreTest(unittest.TestCase):
     def test_schedule_source_previews_keeps_single_timer(self):
         app = object.__new__(appmod.App)
         app.preview_job = "old"
+        app.source_previews_enabled = True
         app.root = mock.Mock()
         app.root.after.return_value = "new"
         appmod.App.schedule_source_previews(app, 25)
         app.root.after_cancel.assert_called_once_with("old")
         app.root.after.assert_called_once_with(25, app.refresh_source_previews)
         self.assertEqual(app.preview_job, "new")
+
+    def test_schedule_source_previews_is_idle_until_enabled(self):
+        app = object.__new__(appmod.App)
+        app.preview_job = None
+        app.source_previews_enabled = False
+        app.root = mock.Mock()
+        appmod.App.schedule_source_previews(app, 25)
+        app.root.after.assert_not_called()
+        self.assertIsNone(app.preview_job)
+        appmod.App.enable_source_previews(app, 25)
+        app.root.after.assert_called_once_with(25, app.refresh_source_previews)
 
     def test_parse_positive_float(self):
         self.assertEqual(parse_positive_float("3.5", "beep_seconds"), 3.5)
@@ -477,6 +689,7 @@ class CoreTest(unittest.TestCase):
         root.deiconify.assert_called_once()
         root.lift.assert_called_once()
         root.after.assert_any_call(350, app.restore_layout)
+        root.after.assert_any_call(500, app.enable_source_previews)
         root.mainloop.assert_called_once()
 
     def test_preview_height_tracks_source_aspect(self):
@@ -541,10 +754,13 @@ class CoreTest(unittest.TestCase):
             app.window_info = {}
             app.window_choice = appmod.StringVar(value="选择应用...")
             app.selected_apps = []
+            app.selected_app_widgets = {}
+            app.selected_empty_app_label = None
             app.source_widgets = {}
             app.preview_lock = mock.Mock()
             app.preview_sources = []
             app.preview_frames = {}
+            app.preview_signatures = {}
             app.monitor_vars = {}
             app.monitor_info = {}
             app.profile = appmod.IntVar(value=1)
@@ -578,6 +794,8 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(app.main_pane.cget("opaqueresize"), 0)
             self.assertEqual(app.main_pane.cget("proxyborderwidth"), 1)
             self.assertEqual(app.main_pane.cget("proxyrelief"), "flat")
+            self.assertEqual(len(app.main_pane.panes()), 3)
+            self.assertTrue(hasattr(app, "source_canvas"))
             root.update_idletasks()
             app.main_pane.sash_place(0, 500, 0)
             app.main_pane.sash_place(1, 800, 0)
@@ -592,6 +810,20 @@ class CoreTest(unittest.TestCase):
             self.assertAlmostEqual(after_preview, before_preview, delta=8)
         finally:
             root.destroy()
+
+    def test_selected_apps_reload_reuses_existing_rows(self):
+        app = object.__new__(appmod.App)
+        app.selected_app_frame = mock.Mock()
+        app.scroll_right = mock.Mock()
+        app.selected_apps = [{"title": "Demo", "ordinal": 1}]
+        app.window_info = {window_key("Demo", 1): {"display": "Demo", "title": "Demo", "ordinal": 1}}
+        row = mock.Mock()
+        label = mock.Mock()
+        app.selected_app_widgets = {window_key("Demo", 1): {"row": row, "label": label, "text": "Demo"}}
+        app.selected_empty_app_label = None
+        appmod.App.reload_selected_apps(app)
+        row.destroy.assert_not_called()
+        label.configure.assert_not_called()
 
     def test_show_window_keeps_existing_tray_icon(self):
         root = appmod.Tk()

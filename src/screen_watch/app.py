@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from tkinter import BooleanVar, Canvas, DoubleVar, Frame, IntVar, Label, PanedWindow, StringVar, Tk, Toplevel, filedialog, messagebox, ttk
@@ -24,7 +25,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageGrab, ImageTk
 
-from .core import Detector, capture_region, config_regions, list_monitors, save_rgb
+from .core import Detector, capture_region, config_regions, list_monitors, parse_scales, save_rgb
 
 
 APP_NAME = "ScreenWatchOCR"
@@ -66,9 +67,9 @@ WS_EX_APPWINDOW = 0x00040000
 PREVIEW_W = 340
 PREVIEW_H = 200
 SCREEN_PREVIEW_SECONDS = 0.25
-MIN_SCAN_INTERVAL_MS = 120
 SOURCE_PREVIEW_SYNC_MS = 250
 DWM_PREVIEW_SYNC_MS = 33
+MIN_SCAN_INTERVAL_MS = 120
 VK_LBUTTON = 0x01
 
 
@@ -306,13 +307,6 @@ def is_under(path, parent):
         return True
     except Exception:
         return False
-
-
-def parse_scales(text):
-    values = [float(x.strip()) for x in text.split(",") if x.strip()]
-    if not values:
-        raise ValueError("scales is empty")
-    return values
 
 
 def parse_positive_int(value, name):
@@ -700,7 +694,14 @@ def capture_window_visible(sct, hwnd):
     return np.frombuffer(shot.rgb, dtype=np.uint8).reshape(shot.height, shot.width, 3)
 
 
-def capture_window_frame(sct, hwnd):
+def capture_window_frame(sct, hwnd, mode_cache=None):
+    mode_key = int(hwnd)
+    if mode_cache and mode_cache.get(mode_key) == "visible":
+        visible = capture_window_visible(sct, hwnd)
+        if visible is not None and not mostly_black(visible):
+            return visible
+        mode_cache.pop(mode_key, None)
+
     frame = capture_window(hwnd)
     if not mostly_black(frame):
         frame = crop_black_padding(frame)
@@ -709,6 +710,8 @@ def capture_window_frame(sct, hwnd):
     visible = capture_window_visible(sct, hwnd)
     if visible is not None and not mostly_black(visible):
         if frame is None or mostly_black(frame) or black_fraction(visible) + 0.1 < black_fraction(frame):
+            if mode_cache is not None and (frame is None or mostly_black(frame)):
+                mode_cache[mode_key] = "visible"
             return visible
     return frame if frame is not None else visible
 
@@ -845,12 +848,16 @@ class App:
         self.selected_apps = []
         self.window_choice = StringVar(value="选择应用...")
         self.window_refresh_job = None
+        self.selected_app_widgets = {}
+        self.selected_empty_app_label = None
         self.source_widgets = {}
         self.dwm_thumbs = {}
         self.preview_sources = []
         self.preview_frames = {}
+        self.preview_signatures = {}
         self.preview_lock = threading.Lock()
         self.preview_job = None
+        self.source_previews_enabled = False
         self.dwm_sync_job = None
         self.worker = None
         self.tray_icon = None
@@ -893,7 +900,6 @@ class App:
         threading.Thread(target=self.run_preview_worker, daemon=True).start()
         self.root.after(250, self.restore_layout)
         self.root.after(1000, self.refresh_windows_loop)
-        self.schedule_source_previews(SOURCE_PREVIEW_SYNC_MS)
         self.root.after(100, self.poll_events)
         if self.root.state() != "withdrawn":
             self.ensure_tray_icon(show_errors=False)
@@ -1202,14 +1208,12 @@ class App:
         app = {"title": item["title"], "ordinal": item.get("ordinal", 1)}
         if self.app_key(app) not in {self.app_key(x) for x in self.selected_apps}:
             self.selected_apps.append(app)
-        self.reload_selected_apps()
         self.refresh_windows()
         self.save_current_profile()
 
     def remove_selected_app(self, app):
         key = self.app_key(app)
         self.selected_apps = [item for item in self.selected_apps if self.app_key(item) != key]
-        self.reload_selected_apps()
         self.refresh_windows()
         self.save_current_profile()
 
@@ -1229,24 +1233,43 @@ class App:
         self.window_choice.set("选择应用...")
 
     def reload_selected_apps(self):
-        for child in self.selected_app_frame.winfo_children():
-            child.destroy()
+        widgets = getattr(self, "selected_app_widgets", {})
         if not self.selected_apps:
-            label = ttk.Label(self.selected_app_frame, text="未选择应用")
-            label.pack(anchor="w")
-            label.bind("<MouseWheel>", self.scroll_right)
+            for record in list(widgets.values()):
+                record["row"].destroy()
+            widgets.clear()
+            if not getattr(self, "selected_empty_app_label", None):
+                self.selected_empty_app_label = ttk.Label(self.selected_app_frame, text="未选择应用")
+                self.selected_empty_app_label.pack(anchor="w")
+                self.selected_empty_app_label.bind("<MouseWheel>", self.scroll_right)
             return
+        if getattr(self, "selected_empty_app_label", None):
+            self.selected_empty_app_label.destroy()
+            self.selected_empty_app_label = None
+        selected_keys = [self.app_key(app) for app in self.selected_apps]
+        for key in list(widgets):
+            if key not in selected_keys:
+                widgets[key]["row"].destroy()
+                del widgets[key]
         for app in self.selected_apps:
-            row = ttk.Frame(self.selected_app_frame)
-            row.pack(fill="x", pady=2)
-            info = self.window_info.get(self.app_key(app))
+            key = self.app_key(app)
+            info = self.window_info.get(key)
             title = info["display"] if info else window_display(app["title"], app.get("ordinal", 1), app.get("ordinal", 1) > 1)
-            button = ttk.Button(row, text="×", width=3, command=lambda a=app: self.remove_selected_app(a))
-            label = ttk.Label(row, text=title)
-            button.pack(side="left")
-            label.pack(side="left", padx=4)
-            for widget in (row, button, label):
-                widget.bind("<MouseWheel>", self.scroll_right)
+            text = title if info else f"{title}（未启动）"
+            record = widgets.get(key)
+            if not record:
+                row = ttk.Frame(self.selected_app_frame)
+                row.pack(fill="x", pady=2)
+                button = ttk.Button(row, text="×", width=3, command=lambda a=app: self.remove_selected_app(a))
+                label = ttk.Label(row)
+                button.pack(side="left")
+                label.pack(side="left", padx=4)
+                for widget in (row, button, label):
+                    widget.bind("<MouseWheel>", self.scroll_right)
+                record = widgets[key] = {"row": row, "label": label}
+            if record.get("text") != text:
+                record["label"].configure(text=text)
+                record["text"] = text
 
     def handle_paste_hotkey(self, _event=None):
         widget = self.root.focus_get()
@@ -1431,8 +1454,10 @@ class App:
     def refresh_source_previews(self):
         self.preview_job = None
         try:
+            if not getattr(self, "source_previews_enabled", True):
+                return
             layout_busy = self.layout_busy()
-            if layout_busy and self.source_widgets:
+            if layout_busy:
                 return
             sources = []
             for monitor in self.selected_regions():
@@ -1441,6 +1466,8 @@ class App:
                 item = self.window_info.get(self.app_key(app))
                 name = item["display"] if item else window_display(app["title"], app.get("ordinal", 1), app.get("ordinal", 1) > 1)
                 sources.append({"key": f"app:{self.app_key(app)}", "kind": "window", "name": name, "source": item, "available": bool(item), "dwm": bool(item and os.name == "nt")})
+            for source in sources:
+                source["signature"] = self.preview_signature(source)
             source_keys = {item["key"] for item in sources}
             with self.preview_lock:
                 self.preview_sources = [dict(item) for item in sources]
@@ -1451,6 +1478,7 @@ class App:
                     del self.source_widgets[key]
                     with self.preview_lock:
                         self.preview_frames.pop(key, None)
+                        self.preview_signatures.pop(key, None)
             if not sources and "empty" not in self.source_widgets:
                 frame = ttk.Frame(self.source_frame)
                 frame.pack(fill="x", padx=6, pady=6)
@@ -1461,6 +1489,10 @@ class App:
                 del self.source_widgets["empty"]
             for source in sources:
                 key = source["key"]
+                with self.preview_lock:
+                    if self.preview_signatures.get(key) != source["signature"]:
+                        self.preview_frames.pop(key, None)
+                        self.preview_signatures.pop(key, None)
                 widgets = self.source_widgets.get(key)
                 if not widgets:
                     outer = ttk.Frame(self.source_frame)
@@ -1506,14 +1538,24 @@ class App:
         except Exception:
             pass
         finally:
-            self.schedule_source_previews(SOURCE_PREVIEW_SYNC_MS)
-            self.ensure_dwm_sync_loop()
+            if getattr(self, "source_previews_enabled", True):
+                self.schedule_source_previews(SOURCE_PREVIEW_SYNC_MS)
+                self.ensure_dwm_sync_loop()
 
     def preview_height(self, source, width):
         data = source.get("source") or {}
         src_w = max(1, int(data.get("width", PREVIEW_W) or PREVIEW_W))
         src_h = max(1, int(data.get("height", PREVIEW_H) or PREVIEW_H))
         return max(120, min(360, int(width * src_h / src_w)))
+
+    def preview_signature(self, source):
+        data = source.get("source") or {}
+        if source.get("kind") == "screen":
+            return (source.get("kind"), data.get("monitor"), data.get("_abs_left"), data.get("_abs_top"), data.get("width"), data.get("height"))
+        return (source.get("kind"), data.get("hwnd"), data.get("width"), data.get("height"))
+
+    def preview_frame_current(self, source):
+        return source.get("kind") == "screen" and self.preview_signatures.get(source["key"]) == source.get("signature") and source["key"] in self.preview_frames
 
     def unregister_dwm_preview(self, key):
         record = self.dwm_thumbs.pop(key, None)
@@ -1530,10 +1572,27 @@ class App:
                 self.root.after_cancel(self.preview_job)
             except TclError:
                 pass
+        if not getattr(self, "source_previews_enabled", True):
+            self.preview_job = None
+            return
         try:
             self.preview_job = self.root.after(delay, self.refresh_source_previews)
         except TclError:
             self.preview_job = None
+
+    def enable_source_previews(self, delay=0):
+        self.source_previews_enabled = True
+        self.schedule_source_previews(delay)
+
+    def disable_source_previews(self):
+        self.source_previews_enabled = False
+        if getattr(self, "preview_job", None):
+            try:
+                self.root.after_cancel(self.preview_job)
+            except TclError:
+                pass
+            self.preview_job = None
+        self.suspend_dwm_previews()
 
     def visible_preview_rect(self, widget):
         try:
@@ -1558,7 +1617,8 @@ class App:
             if record:
                 dwm_update(record["thumb"], 0, 0, 1, 1, visible=False)
                 record["rect"] = None
-            return True
+                return True
+            return False
         x, y, width, height = rect
         root_hwnd = hwnd_for_tk(self.root)
         rel = (x - self.root.winfo_rootx(), y - self.root.winfo_rooty(), width, height)
@@ -1604,6 +1664,9 @@ class App:
 
             with mss() as sct:
                 while not self.close_event.is_set():
+                    if not getattr(self, "source_previews_enabled", True):
+                        time.sleep(0.1)
+                        continue
                     if self.layout_busy():
                         time.sleep(0.05)
                         continue
@@ -1614,10 +1677,14 @@ class App:
                             return
                         if source.get("dwm"):
                             continue
+                        with self.preview_lock:
+                            if self.preview_frame_current(source):
+                                continue
                         frame = self.capture_preview_frame(sct, source)
                         if frame is not None and not mostly_black(frame):
                             with self.preview_lock:
                                 self.preview_frames[source["key"]] = frame
+                                self.preview_signatures[source["key"]] = source.get("signature")
                     time.sleep(SCREEN_PREVIEW_SECONDS)
         except Exception:
             pass
@@ -1628,10 +1695,9 @@ class App:
                 return None
             if source["kind"] == "window":
                 return capture_window_preview(sct, source["source"]["hwnd"])
-            else:
-                monitors = [{"index": i, **m} for i, m in enumerate(sct.monitors)]
-                region = config_regions({"regions": [source["source"]]}, monitors)[0]
-                return capture_region(sct, region)
+            monitors = [{"index": i, **m} for i, m in enumerate(sct.monitors)]
+            region = config_regions({"regions": [source["source"]]}, monitors)[0]
+            return capture_region(sct, region)
         except Exception:
             return None
 
@@ -1643,9 +1709,9 @@ class App:
         return ImageTk.PhotoImage(canvas)
 
     def placeholder_image(self, text, width=PREVIEW_W, height=PREVIEW_H):
-        canvas = Image.new("RGB", (width, height), (54, 58, 64))
+        canvas = Image.new("RGB", (width, height), (245, 245, 245))
         draw = ImageDraw.Draw(canvas)
-        draw.text((14, height // 2 - 8), text, fill=(235, 235, 235))
+        draw.text((14, height // 2 - 8), text, fill=(70, 70, 70))
         return ImageTk.PhotoImage(canvas)
 
     def one_line_name(self, text, width):
@@ -1864,8 +1930,11 @@ class App:
         return img
 
     def hide_to_tray(self):
+        self.disable_source_previews()
         self.root.withdraw()
-        self.ensure_tray_icon(show_errors=True)
+        if not self.ensure_tray_icon(show_errors=True):
+            self.enable_source_previews(250)
+            return
         self.status.set("已缩小到系统托盘。")
 
     def ensure_tray_icon(self, show_errors=False):
@@ -1891,8 +1960,10 @@ class App:
 
     def show_window(self):
         self.ensure_tray_icon(show_errors=False)
+        self.disable_source_previews()
         self.root.deiconify()
         self.root.lift()
+        self.enable_source_previews(250)
 
     def update_tray_icon(self):
         if self.tray_icon:
@@ -2039,6 +2110,9 @@ class App:
 
         detector = Detector(config)
         last_seen = {}
+        parallel_detect = not any(t.get("kind") == "ocr_text" for t in config.get("targets", []))
+        max_workers = max(1, min(4, os.cpu_count() or 1))
+        window_capture_modes = {}
         try:
             with mss() as sct:
                 monitors = [{"index": i, **m} for i, m in enumerate(sct.monitors)]
@@ -2046,35 +2120,42 @@ class App:
                 windows = config.get("windows", [])
                 window_apps = config.get("window_apps", [])
                 last_window_refresh = 0
-                while not self.stop_event.is_set():
-                    started = time.perf_counter()
-                    hit_count = 0
-                    if window_apps and time.time() - last_window_refresh >= 2:
-                        lookup = {item["key"]: item for item in list_app_windows()}
-                        windows = [
-                            {"name": f"app-{safe_name(item['display'])}", "title": item["title"], "display": item["display"], "hwnd": item["hwnd"], "key": item["key"]}
-                            for app in window_apps
-                            for item in [lookup.get(self.app_key(app))]
-                            if item
-                        ]
-                        last_window_refresh = time.time()
-                    for region in regions:
-                        frame = capture_region(sct, region)
-                        matches = detector.run(frame)
-                        if matches:
-                            hit_count += self.emit_alert(config, last_seen, region, frame, matches)
-                    for window in windows:
-                        frame = capture_window_frame(sct, window["hwnd"])
-                        if frame is None:
-                            continue
-                        matches = detector.run(frame)
-                        if matches:
-                            hit_count += self.emit_alert(config, last_seen, window, frame, matches)
-                    elapsed = time.perf_counter() - started
-                    self.events.put(("tick", f"扫描 {len(regions)} 屏 / {len(windows)} 应用 / {len(config['targets'])} 图，用时 {elapsed * 1000:.0f} ms，命中 {hit_count}"))
-                    if once:
-                        return
-                    time.sleep(max(0.01, config["poll_interval_seconds"] - elapsed))
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    while not self.stop_event.is_set():
+                        started = time.perf_counter()
+                        hit_count = 0
+                        if window_apps and time.time() - last_window_refresh >= 2:
+                            lookup = {item["key"]: item for item in list_app_windows()}
+                            windows = [
+                                {"name": f"app-{safe_name(item['display'])}", "title": item["title"], "display": item["display"], "hwnd": item["hwnd"], "key": item["key"]}
+                                for app in window_apps
+                                for item in [lookup.get(self.app_key(app))]
+                                if item
+                            ]
+                            known_hwnds = {int(window["hwnd"]) for window in windows}
+                            for key in list(window_capture_modes):
+                                if key not in known_hwnds:
+                                    window_capture_modes.pop(key, None)
+                            last_window_refresh = time.time()
+                        jobs = []
+                        for region in regions:
+                            jobs.append((region, capture_region(sct, region)))
+                        for window in windows:
+                            frame = capture_window_frame(sct, window["hwnd"], window_capture_modes)
+                            if frame is not None:
+                                jobs.append((window, frame))
+                        if parallel_detect and len(jobs) > 1:
+                            detected = [(item, frame, matches) for (item, frame), matches in zip(jobs, pool.map(lambda job: detector.run(job[1]), jobs))]
+                        else:
+                            detected = [(item, frame, detector.run(frame)) for item, frame in jobs]
+                        for item, frame, matches in detected:
+                            if matches:
+                                hit_count += self.emit_alert(config, last_seen, item, frame, matches)
+                        elapsed = time.perf_counter() - started
+                        self.events.put(("tick", f"扫描 {len(regions)} 屏 / {len(windows)} 应用 / {len(config['targets'])} 图，用时 {elapsed * 1000:.0f} ms，命中 {hit_count}"))
+                        if once:
+                            return
+                        time.sleep(max(0.01, config["poll_interval_seconds"] - elapsed))
         finally:
             self.events.put(("stopped", "已停止"))
 
@@ -2168,6 +2249,7 @@ def main(argv=None):
     root.update_idletasks()
     app.restore_layout()
     root.after(350, app.restore_layout)
+    root.after(500, app.enable_source_previews)
     app.ensure_tray_icon(show_errors=False)
     root.mainloop()
     return 0
