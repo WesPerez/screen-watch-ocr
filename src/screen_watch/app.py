@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import wave
+from datetime import datetime
 from pathlib import Path
 from tkinter import BooleanVar, Canvas, DoubleVar, Frame, IntVar, Label, PanedWindow, StringVar, Tk, Toplevel, filedialog, messagebox, ttk
 from tkinter import TclError
@@ -47,6 +48,7 @@ PROFILES_DIR = DATA_DIR / "profiles"
 THUMBS_DIR = DATA_DIR / "thumbs"
 ALERTS_DIR = DATA_DIR / "screenshots"
 PROFILE_COUNT = 5
+TEMPLATE_NAME_RE = re.compile(r"^(\d+)-(\d+)-(.+)$")
 STARTUP_LINK_NAME = "屏幕监控OCR.lnk"
 MAX_WINDOW_ROWS = 30
 SRCCOPY = 0x00CC0020
@@ -56,13 +58,17 @@ GW_OWNER = 4
 GWL_EXSTYLE = -20
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 DWMWA_CLOAKED = 14
+DWM_TNP_RECTDESTINATION = 0x1
+DWM_TNP_OPACITY = 0x4
+DWM_TNP_VISIBLE = 0x8
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
-PREVIEW_W = 260
-PREVIEW_H = 150
+PREVIEW_W = 340
+PREVIEW_H = 200
 SCREEN_PREVIEW_SECONDS = 0.25
 MIN_SCAN_INTERVAL_MS = 120
-SOURCE_PREVIEW_SYNC_MS = 500
+SOURCE_PREVIEW_SYNC_MS = 250
+DWM_PREVIEW_SYNC_MS = 33
 VK_LBUTTON = 0x01
 
 
@@ -111,6 +117,21 @@ class WindowPlacement(ctypes.Structure):
         ("ptMinPosition", wintypes.POINT),
         ("ptMaxPosition", wintypes.POINT),
         ("rcNormalPosition", wintypes.RECT),
+    ]
+
+
+class Size(ctypes.Structure):
+    _fields_ = [("cx", ctypes.c_int), ("cy", ctypes.c_int)]
+
+
+class DwmThumbnailProperties(ctypes.Structure):
+    _fields_ = [
+        ("dwFlags", wintypes.DWORD),
+        ("rcDestination", wintypes.RECT),
+        ("rcSource", wintypes.RECT),
+        ("opacity", ctypes.c_ubyte),
+        ("fVisible", wintypes.BOOL),
+        ("fSourceClientAreaOnly", wintypes.BOOL),
     ]
 
 
@@ -164,6 +185,14 @@ def configure_winapi():
         dwmapi = ctypes.windll.dwmapi
         dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD]
         dwmapi.DwmGetWindowAttribute.restype = ctypes.HRESULT
+        dwmapi.DwmRegisterThumbnail.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.POINTER(wintypes.HANDLE)]
+        dwmapi.DwmRegisterThumbnail.restype = ctypes.HRESULT
+        dwmapi.DwmUnregisterThumbnail.argtypes = [wintypes.HANDLE]
+        dwmapi.DwmUnregisterThumbnail.restype = ctypes.HRESULT
+        dwmapi.DwmUpdateThumbnailProperties.argtypes = [wintypes.HANDLE, ctypes.POINTER(DwmThumbnailProperties)]
+        dwmapi.DwmUpdateThumbnailProperties.restype = ctypes.HRESULT
+        dwmapi.DwmQueryThumbnailSourceSize.argtypes = [wintypes.HANDLE, ctypes.POINTER(Size)]
+        dwmapi.DwmQueryThumbnailSourceSize.restype = ctypes.HRESULT
     except Exception:
         pass
     _WINAPI_READY = True
@@ -322,17 +351,38 @@ def write_json(path, data):
 
 
 def template_stamp():
-    return time.strftime("%Y%m%d%H%M%S")
+    return datetime.now().strftime("%Y%m%d%H%M%S%f")
 
 
 def template_name(profile, count, stamp=None):
     return f"{int(profile)}-{int(count)}-{stamp or template_stamp()}"
 
 
+def template_suffix(name):
+    match = TEMPLATE_NAME_RE.match(Path(str(name)).stem)
+    return match.group(3) if match else template_stamp()
+
+
+def available_template_name(profile, count, suffix, current_path=None, current_thumb=None):
+    target_dir = DATA_DIR / "templates"
+    current_path = Path(current_path).resolve() if current_path else None
+    current_thumb = Path(current_thumb).resolve() if current_thumb else None
+    while True:
+        stem = template_name(profile, count, suffix)
+        path = (target_dir / f"{stem}.png").resolve()
+        thumb = (THUMBS_DIR / f"{stem}.png").resolve()
+        path_ok = not path.exists() or (current_path and path == current_path)
+        thumb_ok = not thumb.exists() or (current_thumb and thumb == current_thumb)
+        if path_ok and thumb_ok:
+            return stem
+        suffix = template_stamp()
+
+
 def save_template(image, profile, count, stamp=None):
     target_dir = DATA_DIR / "templates"
     target_dir.mkdir(parents=True, exist_ok=True)
-    path = target_dir / f"{template_name(profile, count, stamp)}.png"
+    stem = available_template_name(profile, count, stamp or template_stamp())
+    path = target_dir / f"{stem}.png"
     image.convert("RGB").save(path)
     return path
 
@@ -353,7 +403,8 @@ def ensure_thumb(target):
     path = Path(target["path"])
     if path.exists():
         target = dict(target)
-        target["thumb"] = str(save_thumb(Image.open(path), path))
+        with Image.open(path) as image:
+            target["thumb"] = str(save_thumb(image, path))
     return target
 
 
@@ -373,6 +424,68 @@ def delete_target_files(target):
             except OSError:
                 pass
     return removed
+
+
+def rename_target(target, profile, count):
+    path = Path(target.get("path", ""))
+    if not path.exists() or not is_under(path, DATA_DIR / "templates"):
+        return target, False
+    old_name = target.get("name")
+    thumb = Path(target.get("thumb", ""))
+    old_path = path.resolve()
+    old_thumb = thumb.resolve() if thumb.exists() and is_under(thumb, THUMBS_DIR) else None
+    suffix = template_suffix(path.name)
+    stem = available_template_name(profile, count, suffix, old_path, old_thumb)
+    new_path = DATA_DIR / "templates" / f"{stem}.png"
+    new_thumb = THUMBS_DIR / f"{stem}.png"
+    changed = path.resolve() != new_path.resolve()
+    target = dict(target)
+    if changed:
+        new_path.parent.mkdir(parents=True, exist_ok=True)
+        path.rename(new_path)
+        target["path"] = str(new_path)
+    else:
+        target["path"] = str(path)
+    if old_thumb:
+        if old_thumb != new_thumb.resolve():
+            new_thumb.parent.mkdir(parents=True, exist_ok=True)
+            old_thumb.rename(new_thumb)
+            changed = True
+        target["thumb"] = str(new_thumb)
+    else:
+        with Image.open(new_path) as image:
+            target["thumb"] = str(save_thumb(image, new_path))
+        changed = True
+    target["name"] = stem
+    return target, changed or old_name != stem
+
+
+def normalize_target_names(targets, profile):
+    changed = False
+    renamed = []
+    for index, target in enumerate(targets, 1):
+        updated, did_change = rename_target(target, profile, index)
+        renamed.append(updated)
+        changed = changed or did_change
+    return renamed, changed
+
+
+def normalize_profile_file(number):
+    path = PROFILES_DIR / f"profile_{number}.json"
+    data = load_json(path, {})
+    if not data:
+        return False
+    targets = [ensure_thumb(t) for t in data.get("targets", []) if Path(t.get("path", "")).exists()]
+    targets, changed = normalize_target_names(targets, number)
+    if changed or len(targets) != len(data.get("targets", [])):
+        data["targets"] = targets
+        write_json(path, data)
+        return True
+    return False
+
+
+def normalize_saved_profiles():
+    return sum(1 for number in range(1, PROFILE_COUNT + 1) if normalize_profile_file(number))
 
 
 def prune_alerts(path, max_count):
@@ -473,11 +586,14 @@ def list_app_windows():
     seen = set()
     out = []
     counts = {}
+    title_totals = {}
+    for item in windows:
+        title_totals[item["title"]] = title_totals.get(item["title"], 0) + 1
     for item in sorted(windows, key=lambda x: (x["title"].lower(), x["hwnd"])):
         counts[item["title"]] = counts.get(item["title"], 0) + 1
         item["ordinal"] = counts[item["title"]]
         item["key"] = window_key(item["title"], item["ordinal"])
-        item["display"] = window_display(item["title"], item["ordinal"], sum(1 for w in windows if w["title"] == item["title"]) > 1)
+        item["display"] = window_display(item["title"], item["ordinal"], title_totals[item["title"]] > 1)
         key = (item["hwnd"], item["title"])
         if key not in seen:
             seen.add(key)
@@ -597,6 +713,66 @@ def capture_window_frame(sct, hwnd):
     return frame if frame is not None else visible
 
 
+def capture_window_preview(sct, hwnd):
+    visible = capture_window_visible(sct, hwnd)
+    if visible is not None and not mostly_black(visible):
+        return visible
+    return capture_window_frame(sct, hwnd)
+
+
+def dwm_register(dest_hwnd, source_hwnd):
+    if os.name != "nt":
+        return None
+    configure_winapi()
+    try:
+        thumb = wintypes.HANDLE()
+        if ctypes.windll.dwmapi.DwmRegisterThumbnail(int(dest_hwnd), int(source_hwnd), ctypes.byref(thumb)) != 0:
+            return None
+        return thumb
+    except Exception:
+        return None
+
+
+def dwm_unregister(thumb):
+    try:
+        if thumb:
+            ctypes.windll.dwmapi.DwmUnregisterThumbnail(thumb)
+    except Exception:
+        pass
+
+
+def dwm_update(thumb, x, y, width, height, visible=True):
+    try:
+        props = DwmThumbnailProperties()
+        props.dwFlags = DWM_TNP_VISIBLE | DWM_TNP_OPACITY
+        props.opacity = 255
+        props.fVisible = bool(visible)
+        if not visible:
+            return ctypes.windll.dwmapi.DwmUpdateThumbnailProperties(thumb, ctypes.byref(props)) == 0
+        src = Size()
+        ctypes.windll.dwmapi.DwmQueryThumbnailSourceSize(thumb, ctypes.byref(src))
+        src_w, src_h = max(1, src.cx), max(1, src.cy)
+        scale = min(width / src_w, height / src_h)
+        dst_w, dst_h = max(1, int(src_w * scale)), max(1, int(src_h * scale))
+        left = int(x + (width - dst_w) // 2)
+        top = int(y + (height - dst_h) // 2)
+        props.dwFlags |= DWM_TNP_RECTDESTINATION
+        props.rcDestination = wintypes.RECT(left, top, left + dst_w, top + dst_h)
+        return ctypes.windll.dwmapi.DwmUpdateThumbnailProperties(thumb, ctypes.byref(props)) == 0
+    except Exception:
+        return False
+
+
+def hwnd_for_tk(window):
+    try:
+        return int(window.frame(), 16)
+    except Exception:
+        try:
+            return int(window.winfo_id())
+        except Exception:
+            return 0
+
+
 def beep_wave(volume, milliseconds=180, frequency=1200, sample_rate=22050):
     volume = parse_volume(volume)
     frames = int(sample_rate * milliseconds / 1000)
@@ -622,7 +798,7 @@ def beep_for(seconds, volume=100):
         while time.time() < deadline:
             level = parse_volume(volume() if callable(volume) else volume)
             if level:
-                winsound.PlaySound(beep_wave(level), winsound.SND_MEMORY | winsound.SND_SYNC)
+                winsound.PlaySound(beep_wave(level), winsound.SND_MEMORY)
             else:
                 time.sleep(0.18)
     except Exception:
@@ -635,10 +811,11 @@ class App:
         self.root.title("Screen Watch OCR")
         migrate_legacy_data()
         DATA_DIR.mkdir(parents=True, exist_ok=True)
+        normalize_saved_profiles()
         self.state = load_json(STATE_PATH, {"last_profile": 1, "layout": {}})
         self.layout = self.state.get("layout", {})
         self.main_ratio = float(self.layout.get("main_ratio", 0.72))
-        self.right_ratio = min(0.4, max(0.12, float(self.layout.get("right_ratio", 0.16))))
+        self.right_ratio = min(0.4, max(0.12, float(self.layout.get("right_ratio", 0.22))))
         self.left_ratio = float(self.layout.get("left_ratio", 0.58))
         self.root.geometry(self.layout.get("geometry", "980x680"))
         self.root.minsize(820, 600)
@@ -648,10 +825,12 @@ class App:
         self.targets = []
         self.thumb_refs = []
         self.target_vars = []
+        self.target_cards = {}
+        self.target_last_click = (None, 0)
         self.thumb_cache = {}
         self.selected_target = None
-        self.thumb_w = 128
-        self.thumb_h = 88
+        self.thumb_w = 104
+        self.thumb_h = 72
         self.last_scale = 1.0
         self.resize_job = None
         self.last_root_size = None
@@ -667,10 +846,12 @@ class App:
         self.window_choice = StringVar(value="选择应用...")
         self.window_refresh_job = None
         self.source_widgets = {}
+        self.dwm_thumbs = {}
         self.preview_sources = []
         self.preview_frames = {}
         self.preview_lock = threading.Lock()
         self.preview_job = None
+        self.dwm_sync_job = None
         self.worker = None
         self.tray_icon = None
         self.stop_event = threading.Event()
@@ -698,6 +879,8 @@ class App:
         self.status = StringVar(value="添加图片或 Ctrl+V 粘贴截图，然后开始监控。")
         self.fonts = {name: tkfont.nametofont(name) for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont")}
         self.base_font_sizes = {name: font.cget("size") for name, font in self.fonts.items()}
+        self.target_name_font = self.fonts["TkDefaultFont"].copy()
+        self.target_name_font.configure(size=max(7, int(self.base_font_sizes["TkDefaultFont"] * 0.82)))
         self.style = ttk.Style()
         self.check_widgets = []
         self._build()
@@ -710,17 +893,27 @@ class App:
         threading.Thread(target=self.run_preview_worker, daemon=True).start()
         self.root.after(250, self.restore_layout)
         self.root.after(1000, self.refresh_windows_loop)
-        self.root.after(SOURCE_PREVIEW_SYNC_MS, self.refresh_source_previews)
+        self.schedule_source_previews(SOURCE_PREVIEW_SYNC_MS)
         self.root.after(100, self.poll_events)
         if self.root.state() != "withdrawn":
             self.ensure_tray_icon(show_errors=False)
 
     def _build(self):
-        self.main_pane = PanedWindow(self.root, orient="horizontal", sashwidth=8, sashrelief="raised", bd=0)
+        self.main_pane = PanedWindow(
+            self.root,
+            orient="horizontal",
+            sashwidth=8,
+            sashrelief="raised",
+            bd=0,
+            opaqueresize=False,
+            proxybackground="#1573d1",
+            proxyborderwidth=1,
+            proxyrelief="flat",
+        )
         self.main_pane.pack(fill="both", expand=True, padx=12, pady=12)
         left = ttk.Frame(self.main_pane)
         right_outer = ttk.Frame(self.main_pane, width=300)
-        preview_outer = ttk.Frame(self.main_pane, width=300)
+        preview_outer = ttk.Frame(self.main_pane, width=380)
         self.right_canvas = Canvas(right_outer, highlightthickness=0)
         right_scroll = ttk.Scrollbar(right_outer, orient="vertical", command=self.right_canvas.yview)
         self.right_canvas.configure(yscrollcommand=right_scroll.set)
@@ -734,7 +927,7 @@ class App:
         right.bind("<MouseWheel>", self.scroll_right)
         self.main_pane.add(left, minsize=360, stretch="always")
         self.main_pane.add(right_outer, minsize=260, stretch="never")
-        self.main_pane.add(preview_outer, minsize=260, stretch="never")
+        self.main_pane.add(preview_outer, minsize=320, stretch="never")
         self.main_pane.bind("<ButtonPress-1>", self.begin_layout_drag)
         self.main_pane.bind("<B1-Motion>", self.mark_layout_drag)
         self.main_pane.bind("<ButtonRelease-1>", self.end_layout_drag)
@@ -949,13 +1142,15 @@ class App:
 
     def begin_layout_drag(self, _event=None):
         self.layout_active_until = time.time() + 0.8
+        self.suspend_dwm_previews()
 
     def mark_layout_drag(self, _event=None):
         self.layout_active_until = time.time() + 0.8
 
     def end_layout_drag(self, _event=None):
-        self.layout_active_until = time.time() + 0.3
-        self.capture_layout_ratios()
+        self.layout_active_until = 0
+        self.save_state()
+        self.schedule_source_previews(0)
 
     def layout_busy(self):
         active_until = max(getattr(self, "resize_active_until", 0), getattr(self, "layout_active_until", 0), getattr(self, "move_active_until", 0))
@@ -970,6 +1165,7 @@ class App:
             return False
 
     def refresh_monitors(self):
+        had_monitors = bool(self.monitor_vars)
         selected = {i for i, var in self.monitor_vars.items() if var.get()}
         for child in self.monitor_frame.winfo_children():
             child.destroy()
@@ -977,7 +1173,7 @@ class App:
         monitors = [m for m in list_monitors() if m["index"] != 0]
         self.monitor_info = {m["index"]: m for m in monitors}
         for i, monitor in enumerate(monitors):
-            var = BooleanVar(value=(monitor["index"] in selected) if selected else i == 0)
+            var = BooleanVar(value=(monitor["index"] in selected) if selected or had_monitors else i == 0)
             self.monitor_vars[monitor["index"]] = var
             text = f"{monitor['index']}: {monitor['width']}x{monitor['height']} ({monitor['left']},{monitor['top']})"
             self.make_check(self.monitor_frame, var, text).pack(anchor="w", pady=2)
@@ -1066,7 +1262,8 @@ class App:
     def add_files(self):
         paths = filedialog.askopenfilenames(filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.webp")])
         for path in paths:
-            self.add_image(Path(path).stem, Image.open(path))
+            with Image.open(path) as image:
+                self.add_image(Path(path).stem, image)
 
     def paste_images(self):
         images = read_clipboard_images()
@@ -1074,7 +1271,13 @@ class App:
             self.status.set("剪贴板里没有图片；用截图工具复制后再按 Ctrl+V。")
             return
         for name, image in images:
-            self.add_image(name, image)
+            try:
+                self.add_image(name, image)
+            finally:
+                try:
+                    image.close()
+                except Exception:
+                    pass
 
     def capture_as_target(self):
         try:
@@ -1092,6 +1295,7 @@ class App:
     def add_image(self, name, image):
         max_templates = parse_positive_int(self.max_templates.get(), "max_templates")
         self.prune_targets(max_templates - 1)
+        self.normalize_targets()
         path = save_template(image, self.current_profile, len(self.targets) + 1)
         thumb = save_thumb(image, path)
         with Image.open(path) as saved:
@@ -1101,6 +1305,11 @@ class App:
         self.reload_target_list()
         self.save_current_profile()
         self.status.set(f"已添加 {len(self.targets)} 张模板。")
+
+    def normalize_targets(self):
+        profile = getattr(self, "current_profile", int(self.profile.get()) if hasattr(self, "profile") else 1)
+        self.targets, changed = normalize_target_names(self.targets, profile)
+        return changed
 
     def prune_targets(self, keep_count):
         keep_count = max(0, int(keep_count))
@@ -1118,7 +1327,8 @@ class App:
         key = (str(path), mtime, self.thumb_w, self.thumb_h)
         if key in self.thumb_cache:
             return self.thumb_cache[key]
-        img = Image.open(path).convert("RGB")
+        with Image.open(path) as opened:
+            img = opened.convert("RGB")
         img.thumbnail((self.thumb_w, self.thumb_h))
         canvas = Image.new("RGB", (self.thumb_w, self.thumb_h), (245, 245, 245))
         canvas.paste(img, ((self.thumb_w - img.width) // 2, (self.thumb_h - img.height) // 2))
@@ -1126,8 +1336,40 @@ class App:
         return self.thumb_cache[key]
 
     def select_target(self, index):
+        old = getattr(self, "selected_target", None)
         self.selected_target = index
-        self.reload_target_list()
+        self.update_target_selection(old)
+        self.status.set(f"已选中 {Path(self.targets[index]['path']).name}")
+
+    def click_target(self, index):
+        last_index, last_time = getattr(self, "target_last_click", (None, 0))
+        now = time.monotonic()
+        self.select_target(index)
+        if last_index == index and now - last_time <= 0.5:
+            self.target_last_click = (None, 0)
+            self.open_target_file(index)
+        else:
+            self.target_last_click = (index, now)
+        return "break"
+
+    def open_target_file(self, index):
+        path = Path(self.targets[index]["path"])
+        try:
+            if path.exists():
+                os.startfile(path)
+        except Exception as exc:
+            messagebox.showerror("打开失败", str(exc))
+
+    def update_target_selection(self, old=None):
+        for index in {old, self.selected_target}:
+            if index is None:
+                continue
+            widgets = getattr(self, "target_cards", {}).get(index)
+            if not widgets:
+                continue
+            bg = "#dbeafe" if index == self.selected_target else "#ffffff"
+            for widget in widgets:
+                widget.configure(bg=bg)
 
     def toggle_target(self, index, var):
         self.targets[index]["enabled"] = bool(var.get())
@@ -1151,6 +1393,7 @@ class App:
         if self.selected_target is not None and self.selected_target < len(self.targets):
             delete_target_files(self.targets.pop(self.selected_target))
             self.selected_target = None
+            self.normalize_targets()
         self.reload_target_list()
         self.save_current_profile()
 
@@ -1186,8 +1429,10 @@ class App:
         return source
 
     def refresh_source_previews(self):
+        self.preview_job = None
         try:
-            if self.layout_busy():
+            layout_busy = self.layout_busy()
+            if layout_busy and self.source_widgets:
                 return
             sources = []
             for monitor in self.selected_regions():
@@ -1195,12 +1440,13 @@ class App:
             for app in self.selected_apps:
                 item = self.window_info.get(self.app_key(app))
                 name = item["display"] if item else window_display(app["title"], app.get("ordinal", 1), app.get("ordinal", 1) > 1)
-                sources.append({"key": f"app:{self.app_key(app)}", "kind": "window", "name": name, "source": item, "available": bool(item)})
+                sources.append({"key": f"app:{self.app_key(app)}", "kind": "window", "name": name, "source": item, "available": bool(item), "dwm": bool(item and os.name == "nt")})
             source_keys = {item["key"] for item in sources}
             with self.preview_lock:
                 self.preview_sources = [dict(item) for item in sources]
             for key in list(self.source_widgets):
                 if key not in source_keys:
+                    self.unregister_dwm_preview(key)
                     self.source_widgets[key]["frame"].destroy()
                     del self.source_widgets[key]
                     with self.preview_lock:
@@ -1228,33 +1474,129 @@ class App:
                     name_label.pack(anchor="w", pady=(2, 0))
                     self.source_widgets[key] = {"frame": outer, "area": area, "image": image_label, "name": name_label}
                     widgets = self.source_widgets[key]
-                available_w = max(PREVIEW_W, self.source_canvas.winfo_width() - 24)
-                preview_w = min(420, available_w)
+                available_w = max(PREVIEW_W, self.source_canvas.winfo_width() - 12)
+                preview_w = min(560, available_w)
                 preview_h = self.preview_height(source, preview_w)
                 widgets["area"].configure(width=preview_w, height=preview_h)
-                widgets["image"].place(x=0, y=0, width=preview_w, height=preview_h)
-                with self.preview_lock:
-                    frame = self.preview_frames.get(key)
-                if source["available"] and frame is not None:
-                    photo = self.photo_from_frame(frame, preview_w, preview_h)
+                widgets["name"].configure(wraplength=preview_w)
+                if source.get("dwm") and self.sync_dwm_preview(key, widgets["area"], source["source"]["hwnd"]):
+                    widgets["image"].place_forget()
+                    widgets["image"].image = None
                 else:
-                    photo = self.placeholder_image("等待画面" if source["available"] else "未启动", preview_w, preview_h)
-                widgets["image"].configure(image=photo)
-                widgets["image"].image = photo
+                    self.unregister_dwm_preview(key)
+                    widgets["image"].place(x=0, y=0, width=preview_w, height=preview_h)
+                    with self.preview_lock:
+                        frame = self.preview_frames.get(key)
+                    size = (preview_w, preview_h)
+                    frame_id = id(frame) if frame is not None else None
+                    if source["available"] and frame is not None:
+                        if widgets.get("photo_frame_id") != frame_id or widgets.get("photo_size") != size:
+                            photo = self.photo_from_frame(frame, preview_w, preview_h)
+                            widgets["image"].configure(image=photo)
+                            widgets["image"].image = photo
+                            widgets["photo_frame_id"] = frame_id
+                            widgets["photo_size"] = size
+                    elif not layout_busy or not getattr(widgets["image"], "image", None):
+                        photo = self.placeholder_image("等待画面" if source["available"] else "未启动", preview_w, preview_h)
+                        widgets["image"].configure(image=photo)
+                        widgets["image"].image = photo
+                        widgets["photo_frame_id"] = None
+                        widgets["photo_size"] = size
                 widgets["name"].configure(text=source["name"] if source["available"] else f"{source['name']}（未启动）")
         except Exception:
             pass
         finally:
-            try:
-                self.preview_job = self.root.after(SOURCE_PREVIEW_SYNC_MS, self.refresh_source_previews)
-            except TclError:
-                pass
+            self.schedule_source_previews(SOURCE_PREVIEW_SYNC_MS)
+            self.ensure_dwm_sync_loop()
 
     def preview_height(self, source, width):
         data = source.get("source") or {}
         src_w = max(1, int(data.get("width", PREVIEW_W) or PREVIEW_W))
         src_h = max(1, int(data.get("height", PREVIEW_H) or PREVIEW_H))
-        return max(80, min(260, int(width * src_h / src_w)))
+        return max(120, min(360, int(width * src_h / src_w)))
+
+    def unregister_dwm_preview(self, key):
+        record = self.dwm_thumbs.pop(key, None)
+        if record:
+            dwm_unregister(record["thumb"])
+
+    def suspend_dwm_previews(self):
+        for key in list(getattr(self, "dwm_thumbs", {})):
+            self.unregister_dwm_preview(key)
+
+    def schedule_source_previews(self, delay):
+        if getattr(self, "preview_job", None):
+            try:
+                self.root.after_cancel(self.preview_job)
+            except TclError:
+                pass
+        try:
+            self.preview_job = self.root.after(delay, self.refresh_source_previews)
+        except TclError:
+            self.preview_job = None
+
+    def visible_preview_rect(self, widget):
+        try:
+            if self.root.state() in {"withdrawn", "iconic"} or not widget.winfo_viewable():
+                return None
+            x, y = widget.winfo_rootx(), widget.winfo_rooty()
+            w, h = widget.winfo_width() or PREVIEW_W, widget.winfo_height() or PREVIEW_H
+            bounds = [
+                (self.root.winfo_rootx(), self.root.winfo_rooty(), self.root.winfo_rootx() + self.root.winfo_width(), self.root.winfo_rooty() + self.root.winfo_height()),
+                (self.source_canvas.winfo_rootx(), self.source_canvas.winfo_rooty(), self.source_canvas.winfo_rootx() + self.source_canvas.winfo_width(), self.source_canvas.winfo_rooty() + self.source_canvas.winfo_height()),
+            ]
+            if any(x < left or y < top or x + w > right or y + h > bottom for left, top, right, bottom in bounds):
+                return None
+            return x, y, w, h
+        except Exception:
+            return None
+
+    def sync_dwm_preview(self, key, widget, hwnd):
+        rect = self.visible_preview_rect(widget)
+        record = self.dwm_thumbs.get(key)
+        if rect is None:
+            if record:
+                dwm_update(record["thumb"], 0, 0, 1, 1, visible=False)
+                record["rect"] = None
+            return True
+        x, y, width, height = rect
+        root_hwnd = hwnd_for_tk(self.root)
+        rel = (x - self.root.winfo_rootx(), y - self.root.winfo_rooty(), width, height)
+        if not record or record.get("hwnd") != hwnd or record.get("root") != root_hwnd:
+            self.unregister_dwm_preview(key)
+            thumb = dwm_register(root_hwnd, hwnd)
+            if not thumb:
+                return False
+            self.dwm_thumbs[key] = {"thumb": thumb, "hwnd": hwnd, "root": root_hwnd, "rect": None}
+            record = self.dwm_thumbs[key]
+        try:
+            if record.get("rect") != rel:
+                ok = dwm_update(record["thumb"], rel[0], rel[1], rel[2], rel[3], visible=True)
+                if ok:
+                    record["rect"] = rel
+                return ok
+            return True
+        except Exception:
+            return False
+
+    def ensure_dwm_sync_loop(self):
+        if getattr(self, "dwm_sync_job", None) is None and getattr(self, "dwm_thumbs", None):
+            try:
+                self.dwm_sync_job = self.root.after(DWM_PREVIEW_SYNC_MS, self.sync_dwm_previews_loop)
+            except TclError:
+                self.dwm_sync_job = None
+
+    def sync_dwm_previews_loop(self):
+        self.dwm_sync_job = None
+        try:
+            for key, record in list(self.dwm_thumbs.items()):
+                widgets = self.source_widgets.get(key)
+                if widgets:
+                    self.sync_dwm_preview(key, widgets["area"], record["hwnd"])
+            if self.layout_busy() and self.dwm_thumbs:
+                self.ensure_dwm_sync_loop()
+        except Exception:
+            pass
 
     def run_preview_worker(self):
         try:
@@ -1270,6 +1612,8 @@ class App:
                     for source in sources:
                         if self.close_event.is_set():
                             return
+                        if source.get("dwm"):
+                            continue
                         frame = self.capture_preview_frame(sct, source)
                         if frame is not None and not mostly_black(frame):
                             with self.preview_lock:
@@ -1283,7 +1627,7 @@ class App:
             if not source.get("available"):
                 return None
             if source["kind"] == "window":
-                return capture_window_frame(sct, source["source"]["hwnd"])
+                return capture_window_preview(sct, source["source"]["hwnd"])
             else:
                 monitors = [{"index": i, **m} for i, m in enumerate(sct.monitors)]
                 region = config_regions({"regions": [source["source"]]}, monitors)[0]
@@ -1304,40 +1648,53 @@ class App:
         draw.text((14, height // 2 - 8), text, fill=(235, 235, 235))
         return ImageTk.PhotoImage(canvas)
 
+    def one_line_name(self, text, width):
+        font = self.fonts.get("TkDefaultFont") if hasattr(self, "fonts") else None
+        if not font or font.measure(text) <= width:
+            return text
+        marker = "..."
+        while text and font.measure(text + marker) > width:
+            text = text[:-1]
+        return text + marker
+
     def reload_target_list(self):
         for child in self.gallery_inner.winfo_children():
             child.destroy()
         self.thumb_refs.clear()
         self.target_vars.clear()
+        self.target_cards.clear()
         columns = 5
         for idx, target in enumerate(self.targets):
             row, col = divmod(idx, columns)
-            selected = idx == self.selected_target
+            bg = "#dbeafe" if idx == self.selected_target else "#ffffff"
             card = Frame(
                 self.gallery_inner,
-                bd=2 if selected else 1,
+                bd=1,
                 relief="solid",
-                bg="#cfe8ff" if selected else "#f6f6f6",
-                width=self.thumb_w + 16,
-                height=self.thumb_h + int(58 * self.last_scale),
+                bg=bg,
+                width=self.thumb_w + 12,
+                height=self.thumb_h + max(24, int(22 * self.last_scale)),
             )
             card.grid(row=row, column=col, padx=6, pady=6, sticky="n")
             card.grid_propagate(False)
             enabled_var = BooleanVar(value=target.get("enabled", True))
             self.target_vars.append(enabled_var)
-            check = self.make_check(card, enabled_var, "匹配", command=lambda i=idx, v=enabled_var: self.toggle_target(i, v))
-            check.pack(anchor="w", padx=4, pady=(3, 0))
             thumb = self.make_thumb(target)
             self.thumb_refs.append(thumb)
-            image = Label(card, image=thumb, bg=card["bg"], width=self.thumb_w, height=self.thumb_h)
-            image.pack(pady=(6, 2))
-            text = Label(card, text=Path(target["path"]).name, bg=card["bg"], wraplength=self.thumb_w, justify="center")
-            text.pack(fill="x", padx=4)
+            image = Label(card, image=thumb, bg=bg, width=self.thumb_w, height=self.thumb_h)
+            image.place(x=6, y=6, width=self.thumb_w, height=self.thumb_h)
+            check = ttk.Checkbutton(card, variable=enabled_var, command=lambda i=idx, v=enabled_var: self.toggle_target(i, v))
+            check.place(x=7, y=7, width=18, height=18)
+            filename = self.one_line_name(Path(target["path"]).name, self.thumb_w)
+            text_font = getattr(self, "target_name_font", self.fonts.get("TkDefaultFont"))
+            text = Label(card, text=filename, bg=bg, anchor="center", font=text_font)
+            text.place(x=4, y=self.thumb_h + 8, width=self.thumb_w + 4, height=max(16, int(16 * self.last_scale)))
+            self.target_cards[idx] = (card, image, text)
             for widget in (card, image, text):
-                widget.bind("<Button-1>", lambda _event, i=idx: self.select_target(i))
+                widget.bind("<Button-1>", lambda _event, i=idx: self.click_target(i))
             for widget in (card, check, image, text):
                 widget.bind("<MouseWheel>", self.scroll_targets)
-        self.target_canvas.configure(height=max(180, int((self.thumb_h + 54) * 2)))
+        self.target_canvas.configure(height=max(150, int((self.thumb_h + 34) * 2)))
         self.update_target_select_button()
         self.status.set(f"当前 {len(self.targets)} 张模板，启用 {len(self.enabled_targets())} 张。")
 
@@ -1366,17 +1723,17 @@ class App:
     def capture_layout_ratios(self):
         try:
             root_w = max(1, self.root.winfo_width())
-            root_h = max(1, self.root.winfo_height())
+            left_h = max(1, self.left_pane.winfo_height())
             self.main_ratio = min(0.85, max(0.25, self.main_pane.sash_coord(0)[0] / root_w))
             self.right_ratio = min(0.4, max(0.12, (self.main_pane.sash_coord(1)[0] - self.main_pane.sash_coord(0)[0]) / root_w))
-            self.left_ratio = min(0.8, max(0.25, self.left_pane.sash_coord(0)[1] / root_h))
+            self.left_ratio = min(0.8, max(0.25, self.left_pane.sash_coord(0)[1] / left_h))
         except Exception:
             pass
 
     def side_pane_width(self, width):
         ratio = min(0.4, max(0.12, self.right_ratio))
         max_side = max(180, (int(width) - 360) // 2)
-        min_side = min(260, max_side)
+        min_side = min(320, max_side)
         preferred = int(width * ratio)
         if ratio <= 0.18:
             preferred = min(360, preferred)
@@ -1384,16 +1741,25 @@ class App:
 
     def restore_layout(self, horizontal=True, vertical=True):
         try:
+            width = self.root.winfo_width()
+            left_h = self.left_pane.winfo_height()
+            if self.root.state() == "withdrawn" or (horizontal and width < 400) or (vertical and left_h < 100):
+                if not self.layout_restore_job:
+                    self.layout_restore_job = self.root.after(100, lambda h=horizontal, v=vertical: self.retry_restore_layout(h, v))
+                return
             if horizontal:
-                width = self.root.winfo_width()
                 side_width = self.side_pane_width(width)
                 first = max(360, width - side_width * 2)
                 self.main_pane.sash_place(0, first, 0)
                 self.main_pane.sash_place(1, first + side_width, 0)
             if vertical:
-                self.left_pane.sash_place(0, 0, int(self.root.winfo_height() * self.left_ratio))
+                self.left_pane.sash_place(0, 0, int(left_h * self.left_ratio))
         except Exception:
             pass
+
+    def retry_restore_layout(self, horizontal=True, vertical=True):
+        self.layout_restore_job = None
+        self.restore_layout(horizontal, vertical)
 
     def switch_profile(self, _event=None):
         if self.loading_profile:
@@ -1429,6 +1795,10 @@ class App:
         self.loading_profile = True
         data = load_json(self.profile_path(number), {})
         self.targets = [ensure_thumb(t) for t in data.get("targets", []) if Path(t.get("path", "")).exists()]
+        names_changed = self.normalize_targets()
+        if names_changed:
+            data["targets"] = self.targets
+            write_json(self.profile_path(number), data)
         self.selected_target = 0 if self.targets else None
         region = data.get("region", {})
         self.left.set(region.get("left", "0"))
@@ -1445,8 +1815,8 @@ class App:
         self.beep_volume.set(match.get("beep_volume", 100))
         self.update_beep_volume()
         self.max_templates.set(match.get("max_templates", 100))
-        selected_monitors = set(data.get("monitors", []))
-        if selected_monitors:
+        if "monitors" in data:
+            selected_monitors = set(data.get("monitors", []))
             for i, var in self.monitor_vars.items():
                 var.set(i in selected_monitors)
         self.selected_apps = [app_from_legacy(item) for item in data.get("windows", []) if app_from_legacy(item).get("title")]
@@ -1466,6 +1836,20 @@ class App:
         self.save_state()
         self.stop_event.set()
         self.close_event.set()
+        if self.preview_job:
+            try:
+                self.root.after_cancel(self.preview_job)
+            except TclError:
+                pass
+            self.preview_job = None
+        if self.dwm_sync_job:
+            try:
+                self.root.after_cancel(self.dwm_sync_job)
+            except TclError:
+                pass
+            self.dwm_sync_job = None
+        for key in list(self.dwm_thumbs):
+            self.unregister_dwm_preview(key)
         if self.tray_icon:
             self.tray_icon.stop()
             self.tray_icon = None
@@ -1538,32 +1922,37 @@ class App:
         if size == self.last_root_size:
             self.move_active_until = time.time() + 0.3
             return
+        self.suspend_dwm_previews()
         self.last_root_size = size
         self.resize_active_until = time.time() + 0.3
         if self.resize_job:
             self.root.after_cancel(self.resize_job)
         self.resize_job = self.root.after(120, self.apply_scale)
 
-    def apply_scale(self):
+    def apply_scale(self, force=False):
         self.resize_job = None
-        if self.mouse_button_down():
+        if not force and self.mouse_button_down():
             self.resize_job = self.root.after(120, self.apply_scale)
             return
         width = max(1, self.root.winfo_width())
         height = max(1, self.root.winfo_height())
-        if (width, height) != self.last_root_size:
+        if not force and (width, height) != self.last_root_size:
             return
-        scale = max(0.8, min(1.8, ((width * height) / (980 * 680)) ** 0.5))
-        if abs(scale - self.last_scale) < 0.08:
+        scale = max(0.8, min(1.35, ((width * height) / (980 * 680)) ** 0.5))
+        if not force and abs(scale - self.last_scale) < 0.08:
+            self.schedule_source_previews(0)
             return
         self.last_scale = scale
         for name, font in self.fonts.items():
             font.configure(size=max(8, int(self.base_font_sizes[name] * scale)))
         self.style.configure("Treeview", rowheight=max(22, int(22 * scale)))
-        self.thumb_w = int(128 * scale)
-        self.thumb_h = int(88 * scale)
+        if hasattr(self, "target_name_font"):
+            self.target_name_font.configure(size=max(7, int(self.base_font_sizes["TkDefaultFont"] * 0.82 * scale)))
+        self.thumb_w = int(104 * scale)
+        self.thumb_h = int(72 * scale)
         self.redraw_checks()
         self.reload_target_list()
+        self.schedule_source_previews(0)
 
     def selected_regions(self):
         return [self.region_for(i) for i, var in self.monitor_vars.items() if var.get()]
@@ -1768,6 +2157,17 @@ def main(argv=None):
             os._exit(0)
         return 0
     root = Tk()
-    App(root)
+    root.withdraw()
+    app = App(root)
+    root.update_idletasks()
+    app.last_root_size = (max(1, root.winfo_width()), max(1, root.winfo_height()))
+    app.apply_scale(force=True)
+    root.update_idletasks()
+    root.deiconify()
+    root.lift()
+    root.update_idletasks()
+    app.restore_layout()
+    root.after(350, app.restore_layout)
+    app.ensure_tray_icon(show_errors=False)
     root.mainloop()
     return 0

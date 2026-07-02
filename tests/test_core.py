@@ -1,4 +1,6 @@
 import tempfile
+import sys
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -6,7 +8,7 @@ from unittest import mock
 from PIL import Image
 
 import screen_watch.app as appmod
-from screen_watch.app import app_from_legacy, beep_wave, black_fraction, crop_black_padding, mostly_black, parse_positive_float, parse_positive_int, parse_scales, parse_volume, prune_alerts, scan_interval_ms, template_name, window_key
+from screen_watch.app import app_from_legacy, beep_wave, black_fraction, crop_black_padding, mostly_black, normalize_profile_file, normalize_target_names, parse_positive_float, parse_positive_int, parse_scales, parse_volume, prune_alerts, scan_interval_ms, template_name, window_key
 from screen_watch.core import self_test
 
 
@@ -78,6 +80,83 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(frame.shape, (4, 2, 3))
             self.assertEqual(frame.tolist(), np.full((4, 2, 3), 80, dtype=np.uint8).tolist())
 
+    def test_window_preview_prefers_fast_visible_capture(self):
+        import numpy as np
+
+        visible = np.full((4, 4, 3), 80, dtype=np.uint8)
+        with mock.patch.object(appmod, "capture_window_visible", return_value=visible) as fast, mock.patch.object(appmod, "capture_window_frame") as slow:
+            frame = appmod.capture_window_preview(object(), 123)
+            fast.assert_called_once()
+            slow.assert_not_called()
+            self.assertIs(frame, visible)
+
+    def test_dwm_preview_registers_and_reuses_thumbnail(self):
+        app = object.__new__(appmod.App)
+        app.dwm_thumbs = {}
+        app.root = mock.Mock()
+        app.root.winfo_rootx.return_value = 10
+        app.root.winfo_rooty.return_value = 20
+        app.visible_preview_rect = mock.Mock(return_value=(30, 50, 300, 180))
+        with mock.patch.object(appmod, "hwnd_for_tk", return_value=111), mock.patch.object(appmod, "dwm_register", return_value=object()) as register, mock.patch.object(appmod, "dwm_update", return_value=True) as update:
+            self.assertTrue(appmod.App.sync_dwm_preview(app, "app:x", object(), 222))
+            self.assertTrue(appmod.App.sync_dwm_preview(app, "app:x", object(), 222))
+            register.assert_called_once_with(111, 222)
+            update.assert_called_once_with(app.dwm_thumbs["app:x"]["thumb"], 20, 30, 300, 180, visible=True)
+
+    def test_dwm_sync_loop_schedules_once(self):
+        app = object.__new__(appmod.App)
+        app.dwm_sync_job = None
+        app.dwm_thumbs = {"app:x": {"hwnd": 222}}
+        app.root = mock.Mock()
+        app.root.after.return_value = "job"
+        appmod.App.ensure_dwm_sync_loop(app)
+        appmod.App.ensure_dwm_sync_loop(app)
+        app.root.after.assert_called_once_with(appmod.DWM_PREVIEW_SYNC_MS, app.sync_dwm_previews_loop)
+        self.assertEqual(app.dwm_sync_job, "job")
+
+    def test_dwm_sync_loop_repeats_only_while_layout_busy(self):
+        app = object.__new__(appmod.App)
+        app.dwm_sync_job = "job"
+        app.dwm_thumbs = {"app:x": {"hwnd": 222}}
+        app.source_widgets = {"app:x": {"area": object()}}
+        app.sync_dwm_preview = mock.Mock()
+        app.layout_busy = mock.Mock(return_value=True)
+        app.ensure_dwm_sync_loop = mock.Mock()
+        appmod.App.sync_dwm_previews_loop(app)
+        app.sync_dwm_preview.assert_called_once_with("app:x", app.source_widgets["app:x"]["area"], 222)
+        app.ensure_dwm_sync_loop.assert_called_once()
+
+    def test_suspend_dwm_preview_unregisters_overlay(self):
+        app = object.__new__(appmod.App)
+        thumb = object()
+        app.dwm_thumbs = {"app:x": {"thumb": thumb, "hwnd": 222, "rect": (1, 2, 3, 4)}}
+        with mock.patch.object(appmod, "dwm_unregister") as unregister:
+            appmod.App.suspend_dwm_previews(app)
+            unregister.assert_called_once_with(thumb)
+            self.assertEqual(app.dwm_thumbs, {})
+
+    def test_refresh_source_previews_skips_full_rebuild_while_dragging(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.preview_job = None
+        app.layout_busy = mock.Mock(return_value=True)
+        app.source_widgets = {"app:x": {"frame": mock.Mock()}}
+        app.ensure_dwm_sync_loop = mock.Mock()
+        app.selected_regions = mock.Mock()
+        appmod.App.refresh_source_previews(app)
+        app.selected_regions.assert_not_called()
+        app.root.after.assert_called_once_with(appmod.SOURCE_PREVIEW_SYNC_MS, app.refresh_source_previews)
+
+    def test_schedule_source_previews_keeps_single_timer(self):
+        app = object.__new__(appmod.App)
+        app.preview_job = "old"
+        app.root = mock.Mock()
+        app.root.after.return_value = "new"
+        appmod.App.schedule_source_previews(app, 25)
+        app.root.after_cancel.assert_called_once_with("old")
+        app.root.after.assert_called_once_with(25, app.refresh_source_previews)
+        self.assertEqual(app.preview_job, "new")
+
     def test_parse_positive_float(self):
         self.assertEqual(parse_positive_float("3.5", "beep_seconds"), 3.5)
         with self.assertRaises(ValueError):
@@ -97,9 +176,65 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(parse_volume("150"), 100)
         self.assertGreater(peak(beep_wave(100, milliseconds=20)), peak(beep_wave(10, milliseconds=20)))
 
+    def test_beep_for_uses_supported_winsound_flags(self):
+        calls = []
+        fake_winsound = types.SimpleNamespace(SND_MEMORY=4, PlaySound=lambda data, flags: calls.append((data, flags)))
+        with mock.patch.dict(sys.modules, {"winsound": fake_winsound}), mock.patch.object(appmod, "beep_wave", return_value=b"wav"):
+            appmod.beep_for(0.001, 100)
+        self.assertTrue(calls)
+        self.assertEqual({flags for _data, flags in calls}, {fake_winsound.SND_MEMORY})
+
     def test_template_name_uses_profile_count_date(self):
         self.assertEqual(template_name(1, 11, "20260701"), "1-11-20260701")
-        self.assertRegex(template_name(5, 2), r"^5-2-\d{14}$")
+        self.assertRegex(template_name(5, 2), r"^5-2-\d{20}$")
+
+    def test_normalize_target_names_fills_deleted_number_gap(self):
+        old_data, old_thumbs = appmod.DATA_DIR, appmod.THUMBS_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            appmod.DATA_DIR = base / "data"
+            appmod.THUMBS_DIR = appmod.DATA_DIR / "thumbs"
+            try:
+                targets = []
+                for name in ("1-1-old", "1-3-old"):
+                    template = appmod.DATA_DIR / "templates" / f"{name}.png"
+                    thumb = appmod.THUMBS_DIR / f"{name}.png"
+                    template.parent.mkdir(parents=True, exist_ok=True)
+                    thumb.parent.mkdir(parents=True, exist_ok=True)
+                    Image.new("RGB", (4, 4), "red").save(template)
+                    Image.new("RGB", (4, 4), "blue").save(thumb)
+                    targets.append({"name": name, "path": str(template), "thumb": str(thumb)})
+                renamed, changed = normalize_target_names(targets, 1)
+                self.assertTrue(changed)
+                self.assertEqual([Path(t["path"]).stem for t in renamed], ["1-1-old", "1-2-old"])
+                self.assertTrue(Path(renamed[1]["thumb"]).exists())
+                self.assertFalse((appmod.DATA_DIR / "templates" / "1-3-old.png").exists())
+            finally:
+                appmod.DATA_DIR, appmod.THUMBS_DIR = old_data, old_thumbs
+
+    def test_normalize_profile_file_updates_saved_paths(self):
+        old_data, old_profiles, old_thumbs = appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.THUMBS_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            appmod.DATA_DIR = base / "data"
+            appmod.PROFILES_DIR = appmod.DATA_DIR / "profiles"
+            appmod.THUMBS_DIR = appmod.DATA_DIR / "thumbs"
+            try:
+                targets = []
+                for name in ("1-1-old", "1-3-old"):
+                    template = appmod.DATA_DIR / "templates" / f"{name}.png"
+                    thumb = appmod.THUMBS_DIR / f"{name}.png"
+                    template.parent.mkdir(parents=True, exist_ok=True)
+                    thumb.parent.mkdir(parents=True, exist_ok=True)
+                    Image.new("RGB", (4, 4), "red").save(template)
+                    Image.new("RGB", (4, 4), "blue").save(thumb)
+                    targets.append({"name": name, "path": str(template), "thumb": str(thumb)})
+                appmod.write_json(appmod.PROFILES_DIR / "profile_1.json", {"targets": targets})
+                self.assertTrue(normalize_profile_file(1))
+                data = appmod.load_json(appmod.PROFILES_DIR / "profile_1.json", {})
+                self.assertEqual([Path(t["path"]).stem for t in data["targets"]], ["1-1-old", "1-2-old"])
+            finally:
+                appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.THUMBS_DIR = old_data, old_profiles, old_thumbs
 
     def test_window_selection_keys_and_legacy_profile(self):
         self.assertEqual(window_key("Demo", 2), "Demo" + "\0" + "2")
@@ -152,6 +287,37 @@ class CoreTest(unittest.TestCase):
                 self.assertEqual(len(app2.targets), 1)
                 self.assertFalse(app2.targets[0]["enabled"])
                 self.assertIn("layout", appmod.load_json(appmod.STATE_PATH, {}))
+                root2.destroy()
+            finally:
+                appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH = old_data, old_profiles, old_state
+                appmod.LEGACY_DATA_DIR = old_legacy
+                appmod.THUMBS_DIR, appmod.ALERTS_DIR = old_thumbs, old_alerts
+
+    def test_profile_restores_no_selected_monitors(self):
+        old_data, old_profiles, old_state = appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH
+        old_legacy = appmod.LEGACY_DATA_DIR
+        old_thumbs, old_alerts = appmod.THUMBS_DIR, appmod.ALERTS_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            appmod.DATA_DIR = base / "app_data"
+            appmod.LEGACY_DATA_DIR = base / "missing_legacy"
+            appmod.PROFILES_DIR = appmod.DATA_DIR / "profiles"
+            appmod.STATE_PATH = appmod.DATA_DIR / "state.json"
+            appmod.THUMBS_DIR = appmod.DATA_DIR / "thumbs"
+            appmod.ALERTS_DIR = appmod.DATA_DIR / "screenshots"
+            try:
+                root = appmod.Tk()
+                root.withdraw()
+                app = appmod.App(root)
+                for var in app.monitor_vars.values():
+                    var.set(False)
+                app.save_current_profile()
+                root.destroy()
+
+                root2 = appmod.Tk()
+                root2.withdraw()
+                app2 = appmod.App(root2)
+                self.assertEqual([i for i, var in app2.monitor_vars.items() if var.get()], [])
                 root2.destroy()
             finally:
                 appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH = old_data, old_profiles, old_state
@@ -216,10 +382,45 @@ class CoreTest(unittest.TestCase):
         app.left_ratio = 0.5
         app.main_pane = mock.Mock()
         app.left_pane = mock.Mock()
-        app.root.winfo_height.return_value = 720
+        app.left_pane.winfo_height.return_value = 500
         appmod.App.restore_layout(app, horizontal=False)
         app.main_pane.sash_place.assert_not_called()
-        app.left_pane.sash_place.assert_called_once_with(0, 0, 360)
+        app.left_pane.sash_place.assert_called_once_with(0, 0, 250)
+
+    def test_restore_layout_waits_until_panes_are_mapped(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.root.state.return_value = "withdrawn"
+        app.root.winfo_width.return_value = 1
+        app.root.after.return_value = "job"
+        app.layout_restore_job = None
+        app.left_pane = mock.Mock()
+        app.left_pane.winfo_height.return_value = 1
+        app.main_pane = mock.Mock()
+        appmod.App.restore_layout(app)
+        app.main_pane.sash_place.assert_not_called()
+        app.left_pane.sash_place.assert_not_called()
+        self.assertEqual(app.layout_restore_job, "job")
+
+    def test_left_ratio_uses_left_pane_height(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.root.winfo_width.return_value = 1000
+        app.main_pane = mock.Mock()
+        app.main_pane.sash_coord.side_effect = [(700, 0), (900, 0), (700, 0)]
+        app.left_pane = mock.Mock()
+        app.left_pane.winfo_height.return_value = 500
+        app.left_pane.sash_coord.return_value = (0, 300)
+        appmod.App.capture_layout_ratios(app)
+        self.assertEqual(app.left_ratio, 0.6)
+
+    def test_layout_drag_release_saves_state(self):
+        app = object.__new__(appmod.App)
+        app.save_state = mock.Mock()
+        app.schedule_source_previews = mock.Mock()
+        appmod.App.end_layout_drag(app)
+        app.save_state.assert_called_once()
+        app.schedule_source_previews.assert_called_once_with(0)
 
     def test_apply_scale_does_not_reset_panes_on_outer_resize(self):
         app = object.__new__(appmod.App)
@@ -247,6 +448,37 @@ class CoreTest(unittest.TestCase):
         appmod.App.apply_scale(app)
         app.root.after.assert_called_once_with(120, app.apply_scale)
 
+    def test_apply_scale_force_runs_before_startup_show(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.root.winfo_width.return_value = 1200
+        app.root.winfo_height.return_value = 700
+        app.last_root_size = (1200, 700)
+        app.resize_job = object()
+        app.last_scale = 1.0
+        app.fonts = {}
+        app.base_font_sizes = {}
+        app.style = mock.Mock()
+        app.redraw_checks = mock.Mock()
+        app.reload_target_list = mock.Mock()
+        app.schedule_source_previews = mock.Mock()
+        app.mouse_button_down = mock.Mock(return_value=True)
+        appmod.App.apply_scale(app, force=True)
+        app.root.after.assert_not_called()
+        app.reload_target_list.assert_called_once()
+
+    def test_main_restores_layout_after_window_is_shown(self):
+        root = mock.Mock()
+        root.winfo_width.return_value = 980
+        root.winfo_height.return_value = 680
+        app = mock.Mock()
+        with mock.patch.object(appmod, "Tk", return_value=root), mock.patch.object(appmod, "App", return_value=app):
+            self.assertEqual(appmod.main([]), 0)
+        root.deiconify.assert_called_once()
+        root.lift.assert_called_once()
+        root.after.assert_any_call(350, app.restore_layout)
+        root.mainloop.assert_called_once()
+
     def test_preview_height_tracks_source_aspect(self):
         app = object.__new__(appmod.App)
         source = {"source": {"width": 1920, "height": 1080}}
@@ -257,7 +489,7 @@ class CoreTest(unittest.TestCase):
         app.right_ratio = 0.5
         self.assertEqual(appmod.App.side_pane_width(app, 2388), 955)
         app.right_ratio = 0.16
-        self.assertEqual(appmod.App.side_pane_width(app, 1453), 260)
+        self.assertEqual(appmod.App.side_pane_width(app, 1453), 320)
 
     def test_layout_busy_covers_resize_and_pane_drag(self):
         app = object.__new__(appmod.App)
@@ -343,6 +575,9 @@ class CoreTest(unittest.TestCase):
             app.thumb_cache = {}
             app.selected_target = None
             app._build()
+            self.assertEqual(app.main_pane.cget("opaqueresize"), 0)
+            self.assertEqual(app.main_pane.cget("proxyborderwidth"), 1)
+            self.assertEqual(app.main_pane.cget("proxyrelief"), "flat")
             root.update_idletasks()
             app.main_pane.sash_place(0, 500, 0)
             app.main_pane.sash_place(1, 800, 0)
@@ -422,6 +657,54 @@ class CoreTest(unittest.TestCase):
         app.targets[1]["enabled"] = False
         appmod.App.update_target_select_button(app)
         app.target_select_btn.configure.assert_called_with(text="全选")
+
+    def test_select_target_does_not_redraw_gallery(self):
+        app = object.__new__(appmod.App)
+        app.targets = [{"path": "one.png"}]
+        app.status = mock.Mock()
+        app.reload_target_list = mock.Mock()
+        appmod.App.select_target(app, 0)
+        self.assertEqual(app.selected_target, 0)
+        app.reload_target_list.assert_not_called()
+
+    def test_select_target_marks_only_old_and_new_cards(self):
+        app = object.__new__(appmod.App)
+        old = mock.Mock()
+        new = mock.Mock()
+        other = mock.Mock()
+        app.target_cards = {0: (old,), 1: (new,), 2: (other,)}
+        app.selected_target = 0
+        appmod.App.update_target_selection(app, old=0)
+        app.selected_target = 1
+        appmod.App.update_target_selection(app, old=0)
+        old.configure.assert_called_with(bg="#ffffff")
+        new.configure.assert_called_with(bg="#dbeafe")
+        other.configure.assert_not_called()
+
+    def test_click_target_opens_on_second_click_without_preselect(self):
+        app = object.__new__(appmod.App)
+        app.targets = [{"path": "one.png"}, {"path": "two.png"}, {"path": "three.png"}]
+        app.status = mock.Mock()
+        app.target_cards = {}
+        app.target_last_click = (None, 0)
+        app.open_target_file = mock.Mock()
+        with mock.patch.object(appmod.time, "monotonic", side_effect=[10.0, 10.2, 10.3, 10.6]):
+            appmod.App.click_target(app, 0)
+            appmod.App.click_target(app, 0)
+            appmod.App.click_target(app, 2)
+            appmod.App.click_target(app, 2)
+        self.assertEqual(app.open_target_file.call_args_list, [mock.call(0), mock.call(2)])
+
+    def test_open_target_file_opens_image_directly(self):
+        app = object.__new__(appmod.App)
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "one.png"
+            image.write_bytes(b"x")
+            app.targets = [{"path": str(image)}]
+            with mock.patch.object(appmod.os, "startfile", create=True) as startfile, mock.patch.object(appmod.subprocess, "Popen") as popen:
+                appmod.App.open_target_file(app, 0)
+        startfile.assert_called_once_with(image)
+        popen.assert_not_called()
 
     def test_prune_alerts_keeps_newest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -544,8 +827,8 @@ class CoreTest(unittest.TestCase):
                 app.add_image("two", Image.new("RGB", (12, 10), "blue"))
                 app.add_image("three", Image.new("RGB", (12, 10), "green"))
                 self.assertEqual(len(app.targets), 2)
-                self.assertTrue(Path(app.targets[-1]["path"]).name.startswith("1-2-"))
-                self.assertFalse(any(Path(t["path"]).name.startswith("1-1-") for t in app.targets))
+                self.assertTrue(Path(app.targets[0]["path"]).name.startswith("1-1-"))
+                self.assertTrue(Path(app.targets[1]["path"]).name.startswith("1-2-"))
                 root.destroy()
             finally:
                 appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH = old_data, old_profiles, old_state

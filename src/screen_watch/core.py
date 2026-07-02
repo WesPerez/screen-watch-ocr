@@ -121,7 +121,16 @@ class Detector:
                 image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
                 if image is None:
                     raise ValueError(f"cannot read template {path}")
-                self.templates[target["name"]] = image
+                scaled = []
+                for scale in target.get("scales", [1.0]):
+                    if float(scale) == 1.0:
+                        item = image
+                    else:
+                        w = max(1, int(image.shape[1] * float(scale)))
+                        h = max(1, int(image.shape[0] * float(scale)))
+                        item = cv2.resize(image, (w, h), interpolation=cv2.INTER_AREA)
+                    scaled.append((item, float(np.std(item)) < 1))
+                self.templates[target["name"]] = scaled
 
     def _path(self, value):
         path = Path(value)
@@ -161,18 +170,12 @@ class Detector:
         return None
 
     def _template(self, gray, target):
-        template = self.templates[target["name"]]
         threshold = float(target.get("threshold", 0.9))
         best = None
-        for scale in target.get("scales", [1.0]):
-            scaled = template
-            if float(scale) != 1.0:
-                w = max(1, int(template.shape[1] * float(scale)))
-                h = max(1, int(template.shape[0] * float(scale)))
-                scaled = cv2.resize(template, (w, h), interpolation=cv2.INTER_AREA)
+        for scaled, is_flat in self.templates[target["name"]]:
             if scaled.shape[0] > gray.shape[0] or scaled.shape[1] > gray.shape[1]:
                 continue
-            if float(np.std(scaled)) < 1:
+            if is_flat:
                 result = cv2.matchTemplate(gray, scaled, cv2.TM_SQDIFF_NORMED)
                 min_val, _, min_loc, _ = cv2.minMaxLoc(result)
                 score, loc = 1 - float(min_val), min_loc
