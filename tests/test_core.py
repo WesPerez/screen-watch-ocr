@@ -1,4 +1,5 @@
 import tempfile
+import socket
 import sys
 import types
 import unittest
@@ -614,6 +615,24 @@ class CoreTest(unittest.TestCase):
         app.left_pane.sash_place.assert_not_called()
         self.assertEqual(app.layout_restore_job, "job")
 
+    def test_restore_layout_applies_horizontal_when_vertical_not_ready(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.root.state.return_value = "normal"
+        app.root.winfo_width.return_value = 1200
+        app.root.after.return_value = "job"
+        app.layout_restore_job = None
+        app.main_ratio = 0.42
+        app.right_ratio = 0.25
+        app.left_ratio = 0.5
+        app.left_pane = mock.Mock()
+        app.left_pane.winfo_height.return_value = 1
+        app.main_pane = mock.Mock()
+        appmod.App.restore_layout(app)
+        app.main_pane.sash_place.assert_has_calls([mock.call(0, 504, 0), mock.call(1, 804, 0)])
+        app.left_pane.sash_place.assert_not_called()
+        app.root.after.assert_called_once()
+
     def test_left_ratio_uses_left_pane_height(self):
         app = object.__new__(appmod.App)
         app.root = mock.Mock()
@@ -684,13 +703,20 @@ class CoreTest(unittest.TestCase):
         root.winfo_width.return_value = 980
         root.winfo_height.return_value = 680
         app = mock.Mock()
-        with mock.patch.object(appmod, "Tk", return_value=root), mock.patch.object(appmod, "App", return_value=app):
+        with mock.patch.object(appmod, "claim_single_instance", return_value=False), mock.patch.object(appmod, "Tk", return_value=root), mock.patch.object(appmod, "App", return_value=app):
             self.assertEqual(appmod.main([]), 0)
         root.deiconify.assert_called_once()
         root.lift.assert_called_once()
+        root.attributes.assert_any_call("-alpha", 0.0)
+        root.attributes.assert_any_call("-alpha", 1.0)
         root.after.assert_any_call(350, app.restore_layout)
         root.after.assert_any_call(500, app.enable_source_previews)
         root.mainloop.assert_called_once()
+
+    def test_main_exits_when_existing_instance_accepts_wake(self):
+        with mock.patch.object(appmod, "claim_single_instance", return_value=None), mock.patch.object(appmod, "Tk") as tk:
+            self.assertEqual(appmod.main([]), 0)
+        tk.assert_not_called()
 
     def test_preview_height_tracks_source_aspect(self):
         app = object.__new__(appmod.App)
@@ -703,6 +729,12 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(appmod.App.side_pane_width(app, 2388), 955)
         app.right_ratio = 0.16
         self.assertEqual(appmod.App.side_pane_width(app, 1453), 320)
+
+    def test_horizontal_sashes_restore_saved_three_column_widths(self):
+        app = object.__new__(appmod.App)
+        app.main_ratio = 0.42
+        app.right_ratio = 0.25
+        self.assertEqual(appmod.App.horizontal_sashes(app, 1200), (504, 804))
 
     def test_layout_busy_covers_resize_and_pane_drag(self):
         app = object.__new__(appmod.App)
@@ -837,6 +869,27 @@ class CoreTest(unittest.TestCase):
             self.assertIs(app.tray_icon, marker)
         finally:
             root.destroy()
+
+    def test_single_instance_notification_wakes_existing_app(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind((appmod.INSTANCE_HOST, 0))
+            port = probe.getsockname()[1]
+
+        app = object.__new__(appmod.App)
+        app.close_event = appmod.threading.Event()
+        app.root = mock.Mock()
+        app.root.after.side_effect = lambda _delay, func: func()
+        app.show_window = mock.Mock()
+        with mock.patch.object(appmod, "INSTANCE_PORT", port):
+            sock = appmod.claim_single_instance()
+            try:
+                appmod.App.start_instance_listener(app, sock)
+                self.assertTrue(appmod.notify_existing_instance())
+                app.show_window.assert_called_once()
+            finally:
+                app.close_event.set()
+                if app.instance_socket:
+                    app.instance_socket.close()
 
     def test_remove_selected_deletes_template_and_thumb_files(self):
         old_data, old_thumbs = appmod.DATA_DIR, appmod.THUMBS_DIR

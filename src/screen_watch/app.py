@@ -7,6 +7,7 @@ import os
 import queue
 import re
 import shutil
+import socket
 import subprocess
 import struct
 import sys
@@ -71,6 +72,10 @@ SOURCE_PREVIEW_SYNC_MS = 250
 DWM_PREVIEW_SYNC_MS = 33
 MIN_SCAN_INTERVAL_MS = 120
 VK_LBUTTON = 0x01
+INSTANCE_HOST = "127.0.0.1"
+INSTANCE_PORT = 47627
+INSTANCE_COMMAND = b"ScreenWatchOCR:show\n"
+INSTANCE_ACK = b"ok\n"
 
 
 def enable_dpi_awareness():
@@ -88,6 +93,30 @@ def enable_dpi_awareness():
 
 
 enable_dpi_awareness()
+
+
+def notify_existing_instance(timeout=0.5):
+    try:
+        with socket.create_connection((INSTANCE_HOST, INSTANCE_PORT), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(INSTANCE_COMMAND)
+            return sock.recv(len(INSTANCE_ACK)) == INSTANCE_ACK
+    except OSError:
+        return False
+
+
+def claim_single_instance():
+    if notify_existing_instance():
+        return None
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((INSTANCE_HOST, INSTANCE_PORT))
+        sock.listen(5)
+        sock.settimeout(0.5)
+        return sock
+    except OSError:
+        sock.close()
+        return False
 
 
 class BitmapInfoHeader(ctypes.Structure):
@@ -820,6 +849,7 @@ class App:
         self.main_ratio = float(self.layout.get("main_ratio", 0.72))
         self.right_ratio = min(0.4, max(0.12, float(self.layout.get("right_ratio", 0.22))))
         self.left_ratio = float(self.layout.get("left_ratio", 0.58))
+        self.instance_socket = None
         self.root.geometry(self.layout.get("geometry", "980x680"))
         self.root.minsize(820, 600)
         self.current_profile = int(self.state.get("last_profile", 1))
@@ -1805,21 +1835,37 @@ class App:
             preferred = min(360, preferred)
         return max(min_side, min(max_side, preferred))
 
+    def horizontal_sashes(self, width):
+        width = max(1, int(width))
+        left_min, middle_min, preview_min = 360, 260, 320
+        if width < left_min + middle_min + preview_min:
+            middle = self.side_pane_width(width)
+            first = max(left_min, width - middle * 2)
+            return first, first + middle
+        first = round(width * min(0.85, max(0.25, self.main_ratio)))
+        second = round(width * min(0.97, max(0.37, self.main_ratio + self.right_ratio)))
+        first = min(max(left_min, first), width - middle_min - preview_min)
+        second = min(max(first + middle_min, second), width - preview_min)
+        return first, second
+
     def restore_layout(self, horizontal=True, vertical=True):
         try:
             width = self.root.winfo_width()
             left_h = self.left_pane.winfo_height()
-            if self.root.state() == "withdrawn" or (horizontal and width < 400) or (vertical and left_h < 100):
+            if self.root.state() == "withdrawn":
                 if not self.layout_restore_job:
                     self.layout_restore_job = self.root.after(100, lambda h=horizontal, v=vertical: self.retry_restore_layout(h, v))
                 return
-            if horizontal:
-                side_width = self.side_pane_width(width)
-                first = max(360, width - side_width * 2)
+            retry_horizontal = horizontal and width < 400
+            retry_vertical = vertical and left_h < 100
+            if horizontal and not retry_horizontal:
+                first, second = self.horizontal_sashes(width)
                 self.main_pane.sash_place(0, first, 0)
-                self.main_pane.sash_place(1, first + side_width, 0)
-            if vertical:
+                self.main_pane.sash_place(1, second, 0)
+            if vertical and not retry_vertical:
                 self.left_pane.sash_place(0, 0, int(left_h * self.left_ratio))
+            if (retry_horizontal or retry_vertical) and not self.layout_restore_job:
+                self.layout_restore_job = self.root.after(100, lambda h=retry_horizontal, v=retry_vertical: self.retry_restore_layout(h, v))
         except Exception:
             pass
 
@@ -1902,6 +1948,12 @@ class App:
         self.save_state()
         self.stop_event.set()
         self.close_event.set()
+        if self.instance_socket:
+            try:
+                self.instance_socket.close()
+            except OSError:
+                pass
+            self.instance_socket = None
         if self.preview_job:
             try:
                 self.root.after_cancel(self.preview_job)
@@ -1963,7 +2015,32 @@ class App:
         self.disable_source_previews()
         self.root.deiconify()
         self.root.lift()
+        try:
+            self.root.focus_force()
+        except TclError:
+            pass
         self.enable_source_previews(250)
+
+    def start_instance_listener(self, sock):
+        self.instance_socket = sock
+
+        def listen():
+            while not self.close_event.is_set():
+                try:
+                    conn, _addr = sock.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                with conn:
+                    try:
+                        if conn.recv(len(INSTANCE_COMMAND)) == INSTANCE_COMMAND:
+                            conn.sendall(INSTANCE_ACK)
+                            self.root.after(0, self.show_window)
+                    except OSError:
+                        pass
+
+        threading.Thread(target=listen, daemon=True).start()
 
     def update_tray_icon(self):
         if self.tray_icon:
@@ -2237,9 +2314,18 @@ def main(argv=None):
         if getattr(sys, "frozen", False):
             os._exit(0)
         return 0
+    instance_socket = claim_single_instance()
+    if instance_socket is None:
+        return 0
     root = Tk()
     root.withdraw()
+    try:
+        root.attributes("-alpha", 0.0)
+    except TclError:
+        pass
     app = App(root)
+    if instance_socket:
+        app.start_instance_listener(instance_socket)
     root.update_idletasks()
     app.last_root_size = (max(1, root.winfo_width()), max(1, root.winfo_height()))
     app.apply_scale(force=True)
@@ -2248,6 +2334,11 @@ def main(argv=None):
     root.lift()
     root.update_idletasks()
     app.restore_layout()
+    root.update_idletasks()
+    try:
+        root.attributes("-alpha", 1.0)
+    except TclError:
+        pass
     root.after(350, app.restore_layout)
     root.after(500, app.enable_source_previews)
     app.ensure_tray_icon(show_errors=False)
