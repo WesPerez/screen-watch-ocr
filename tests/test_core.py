@@ -164,6 +164,7 @@ class CoreTest(unittest.TestCase):
             app = object.__new__(appmod.App)
             value = appmod.StringVar(value="250")
             entry = appmod.App.make_entry(app, root, value)
+            self.assertEqual(entry.cget("justify"), "left")
             entry.pack()
             root.update()
             entry.event_generate("<ButtonPress-1>", x=2, y=2)
@@ -174,6 +175,38 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(entry.index("insert"), 3)
         finally:
             root.destroy()
+
+    def test_custom_check_indicator_scales(self):
+        root = appmod.Tk()
+        try:
+            app = object.__new__(appmod.App)
+            app.last_scale = 2.0
+            app.check_widgets = []
+            app.fonts = {"TkDefaultFont": appmod.tkfont.nametofont("TkDefaultFont")}
+            var = appmod.BooleanVar(value=True)
+            check = appmod.App.make_check(app, root, var, "匹配")
+            check.pack()
+            root.update()
+            box = check._check_parts[0]
+            self.assertGreaterEqual(int(box.cget("width")), 26)
+            check.event_generate("<Button-1>")
+            self.assertFalse(var.get())
+        finally:
+            root.destroy()
+
+    def test_resize_ignores_window_moves_without_size_change(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.last_root_size = (980, 680)
+        app.resize_job = None
+        event = type("Event", (), {"widget": app.root, "width": 980, "height": 680})()
+        appmod.App.on_resize(app, event)
+        app.root.after.assert_not_called()
+
+    def test_preview_height_tracks_source_aspect(self):
+        app = object.__new__(appmod.App)
+        source = {"source": {"width": 1920, "height": 1080}}
+        self.assertEqual(appmod.App.preview_height(app, source, 260), 146)
 
     def test_show_window_keeps_existing_tray_icon(self):
         root = appmod.Tk()

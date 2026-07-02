@@ -63,9 +63,9 @@ WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
 PREVIEW_W = 260
 PREVIEW_H = 150
-SCREEN_PREVIEW_SECONDS = 0.016
+SCREEN_PREVIEW_SECONDS = 0.10
 MIN_SCAN_INTERVAL_MS = 120
-SOURCE_PREVIEW_SYNC_MS = 16
+SOURCE_PREVIEW_SYNC_MS = 100
 
 
 def enable_dpi_awareness():
@@ -716,8 +716,10 @@ class App:
         self.state = load_json(STATE_PATH, {"last_profile": 1, "layout": {}})
         self.layout = self.state.get("layout", {})
         self.main_ratio = float(self.layout.get("main_ratio", 0.72))
+        self.right_ratio = float(self.layout.get("right_ratio", 0.5))
         self.left_ratio = float(self.layout.get("left_ratio", 0.58))
         self.root.geometry(self.layout.get("geometry", "980x680"))
+        self.root.minsize(820, 600)
         self.current_profile = int(self.state.get("last_profile", 1))
         self.current_profile = min(PROFILE_COUNT, max(1, self.current_profile))
         self.loading_profile = False
@@ -730,6 +732,8 @@ class App:
         self.thumb_h = 88
         self.last_scale = 1.0
         self.resize_job = None
+        self.last_root_size = None
+        self.resize_active_until = 0
         self.layout_restore_job = None
         self.monitor_vars = {}
         self.monitor_info = {}
@@ -772,6 +776,7 @@ class App:
         self.fonts = {name: tkfont.nametofont(name) for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont")}
         self.base_font_sizes = {name: font.cget("size") for name, font in self.fonts.items()}
         self.style = ttk.Style()
+        self.check_widgets = []
         self._build()
         self.refresh_monitors()
         self.refresh_windows()
@@ -794,15 +799,17 @@ class App:
         left = ttk.Frame(self.main_pane)
         right_outer = ttk.Frame(self.main_pane, width=300)
         preview_outer = ttk.Frame(self.main_pane, width=300)
-        right_canvas = Canvas(right_outer, highlightthickness=0)
-        right_scroll = ttk.Scrollbar(right_outer, orient="vertical", command=right_canvas.yview)
-        right_canvas.configure(yscrollcommand=right_scroll.set)
+        self.right_canvas = Canvas(right_outer, highlightthickness=0)
+        right_scroll = ttk.Scrollbar(right_outer, orient="vertical", command=self.right_canvas.yview)
+        self.right_canvas.configure(yscrollcommand=right_scroll.set)
         right_scroll.pack(side="right", fill="y")
-        right_canvas.pack(side="left", fill="both", expand=True)
-        right = ttk.Frame(right_canvas)
-        right_window = right_canvas.create_window((0, 0), window=right, anchor="nw")
-        right.bind("<Configure>", lambda _event: right_canvas.configure(scrollregion=right_canvas.bbox("all")))
-        right_canvas.bind("<Configure>", lambda event: right_canvas.itemconfigure(right_window, width=event.width))
+        self.right_canvas.pack(side="left", fill="both", expand=True)
+        right = ttk.Frame(self.right_canvas)
+        right_window = self.right_canvas.create_window((0, 0), window=right, anchor="nw")
+        right.bind("<Configure>", lambda _event: self.right_canvas.configure(scrollregion=self.right_canvas.bbox("all")))
+        self.right_canvas.bind("<Configure>", lambda event: self.right_canvas.itemconfigure(right_window, width=event.width))
+        self.right_canvas.bind("<MouseWheel>", self.scroll_right)
+        right.bind("<MouseWheel>", self.scroll_right)
         self.main_pane.add(left, minsize=360)
         self.main_pane.add(right_outer, minsize=260)
         self.main_pane.add(preview_outer, minsize=260)
@@ -889,16 +896,18 @@ class App:
         for label, var in [("左", self.left), ("上", self.top), ("宽(空=全屏)", self.width), ("高(空=全屏)", self.height)]:
             row = ttk.Frame(region_box)
             row.pack(fill="x", padx=8, pady=3)
-            ttk.Label(row, text=label, width=12).pack(side="left")
-            self.make_entry(row, var).pack(side="right", fill="x", expand=True)
+            row.columnconfigure(1, weight=1)
+            ttk.Label(row, text=label, width=11).grid(row=0, column=0, sticky="w")
+            self.make_entry(row, var).grid(row=0, column=1, sticky="ew")
 
         match_box = ttk.LabelFrame(right, text="匹配")
         match_box.pack(fill="x")
         for label, var in [("阈值", self.threshold), ("缩放", self.scales), ("间隔ms", self.interval_ms), ("同图冷却秒", self.cooldown), ("蜂鸣秒", self.beep_seconds), ("蜂鸣音量", self.beep_volume), ("模板最多张", self.max_templates), ("截图最多张", self.max_alerts)]:
             row = ttk.Frame(match_box)
             row.pack(fill="x", padx=8, pady=3)
-            ttk.Label(row, text=label, width=12).pack(side="left")
-            self.make_entry(row, var).pack(side="right", fill="x", expand=True)
+            row.columnconfigure(1, weight=1)
+            ttk.Label(row, text=label, width=11).grid(row=0, column=0, sticky="w")
+            self.make_entry(row, var).grid(row=0, column=1, sticky="ew")
         self.make_check(match_box, self.beep, "命中蜂鸣").pack(anchor="w", padx=8, pady=4)
 
         actions = ttk.LabelFrame(right, text="运行")
@@ -909,15 +918,24 @@ class App:
         ttk.Button(actions, text="打开证据目录", command=self.open_evidence).pack(fill="x", padx=8, pady=(4, 8))
 
         ttk.Label(right, textvariable=self.status, wraplength=300).pack(fill="x", pady=8)
+        self.bind_mousewheel(right, self.scroll_right)
 
     def make_entry(self, parent, var):
-        entry = ttk.Entry(parent, textvariable=var, justify="right")
-        for sequence in ("<FocusIn>", "<ButtonPress-1>", "<Button-1>", "<ButtonRelease-1>", "<B1-Motion>", "<Double-Button-1>"):
-            entry.bind(sequence, self.focus_entry_end)
+        entry = ttk.Entry(parent, textvariable=var, justify="left", width=8)
+        entry.bind("<FocusIn>", self.focus_entry_end)
+        for sequence in ("<ButtonPress-1>", "<Button-1>", "<ButtonRelease-1>", "<B1-Motion>", "<Double-Button-1>"):
+            entry.bind(sequence, self.click_entry_end)
         return entry
 
     def focus_entry_end(self, event):
-        event.widget.focus_set()
+        self.entry_cursor_end(event.widget)
+        return None
+
+    def click_entry_end(self, event):
+        try:
+            event.widget.focus_set()
+        except TclError:
+            pass
         self.entry_cursor_end(event.widget)
         return "break"
 
@@ -936,13 +954,70 @@ class App:
             widget.after(delay, apply)
 
     def make_check(self, parent, var, label, command=None):
-        return ttk.Checkbutton(parent, text=label, variable=var, command=command)
+        try:
+            bg = parent.cget("bg")
+        except TclError:
+            bg = "SystemButtonFace"
+        frame = Frame(parent, bg=bg, cursor="hand2")
+        box = Canvas(frame, highlightthickness=0, bd=0, bg=bg)
+        text = Label(frame, text=label, font=self.fonts["TkDefaultFont"], bg=bg, anchor="w", cursor="hand2")
+        box.pack(side="left", padx=(0, 4))
+        text.pack(side="left", fill="x", expand=True)
+
+        def draw(*_args):
+            size = max(12, int(13 * self.last_scale))
+            box.configure(width=size, height=size)
+            box.delete("all")
+            box.create_rectangle(1, 1, size - 2, size - 2, outline="#666666", fill="#ffffff")
+            if var.get():
+                box.create_line(size * 0.22, size * 0.52, size * 0.42, size * 0.72, size * 0.78, size * 0.28, width=max(2, int(2 * self.last_scale)), fill="#1573d1")
+
+        def toggle(_event=None):
+            var.set(not var.get())
+            draw()
+            if command:
+                command()
+            return "break"
+
+        for widget in (frame, box, text):
+            widget.bind("<Button-1>", toggle)
+        if hasattr(self, "right_canvas") and self.is_descendant(parent, self.right_canvas):
+            for widget in (frame, box, text):
+                widget.bind("<MouseWheel>", self.scroll_right)
+        trace_id = var.trace_add("write", draw)
+        frame._check_parts = (box, var, trace_id, draw)
+        self.check_widgets.append(frame)
+        draw()
+        return frame
+
+    def redraw_checks(self):
+        for widget in list(self.check_widgets):
+            try:
+                widget._check_parts[3]()
+            except Exception:
+                pass
+
+    def bind_mousewheel(self, widget, handler):
+        widget.bind("<MouseWheel>", handler)
+        for child in widget.winfo_children():
+            self.bind_mousewheel(child, handler)
+
+    def is_descendant(self, widget, parent):
+        while widget:
+            if widget == parent:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
 
     def update_beep_volume(self):
         self.beep_volume_level = parse_volume(self.beep_volume.get())
 
     def scroll_targets(self, event):
         self.target_canvas.yview_scroll(int(-event.delta / 120), "units")
+        return "break"
+
+    def scroll_right(self, event):
+        self.right_canvas.yview_scroll(int(-event.delta / 120), "units")
         return "break"
 
     def refresh_monitors(self):
@@ -1011,15 +1086,21 @@ class App:
         for child in self.selected_app_frame.winfo_children():
             child.destroy()
         if not self.selected_apps:
-            ttk.Label(self.selected_app_frame, text="未选择应用").pack(anchor="w")
+            label = ttk.Label(self.selected_app_frame, text="未选择应用")
+            label.pack(anchor="w")
+            label.bind("<MouseWheel>", self.scroll_right)
             return
         for app in self.selected_apps:
             row = ttk.Frame(self.selected_app_frame)
             row.pack(fill="x", pady=2)
             info = self.window_info.get(self.app_key(app))
             title = info["display"] if info else window_display(app["title"], app.get("ordinal", 1), app.get("ordinal", 1) > 1)
-            ttk.Button(row, text="×", width=3, command=lambda a=app: self.remove_selected_app(a)).pack(side="left")
-            ttk.Label(row, text=title).pack(side="left", padx=4)
+            button = ttk.Button(row, text="×", width=3, command=lambda a=app: self.remove_selected_app(a))
+            label = ttk.Label(row, text=title)
+            button.pack(side="left")
+            label.pack(side="left", padx=4)
+            for widget in (row, button, label):
+                widget.bind("<MouseWheel>", self.scroll_right)
 
     def handle_paste_hotkey(self, _event=None):
         widget = self.root.focus_get()
@@ -1162,7 +1243,7 @@ class App:
             for app in self.selected_apps:
                 item = self.window_info.get(self.app_key(app))
                 name = item["display"] if item else window_display(app["title"], app.get("ordinal", 1), app.get("ordinal", 1) > 1)
-                sources.append({"key": f"app:{self.app_key(app)}", "kind": "window", "name": name, "source": item, "available": bool(item), "dwm": bool(item and os.name == "nt")})
+                sources.append({"key": f"app:{self.app_key(app)}", "kind": "window", "name": name, "source": item, "available": bool(item)})
             source_keys = {item["key"] for item in sources}
             with self.preview_lock:
                 self.preview_sources = [dict(item) for item in sources]
@@ -1188,7 +1269,7 @@ class App:
                     outer = ttk.Frame(self.source_frame)
                     outer.pack(fill="x", padx=6, pady=6)
                     area = Frame(outer, bg="#141414", width=PREVIEW_W, height=PREVIEW_H)
-                    area.pack(fill="x")
+                    area.pack(anchor="w")
                     area.pack_propagate(False)
                     image_label = Label(area, bg="#141414")
                     image_label.place(x=0, y=0, width=PREVIEW_W, height=PREVIEW_H)
@@ -1196,17 +1277,17 @@ class App:
                     name_label.pack(anchor="w", pady=(2, 0))
                     self.source_widgets[key] = {"frame": outer, "area": area, "image": image_label, "name": name_label}
                     widgets = self.source_widgets[key]
-                if source.get("dwm") and self.sync_dwm_preview(key, widgets["area"], source["source"]["hwnd"]):
-                    widgets["image"].place_forget()
-                    widgets["image"].image = None
-                else:
-                    self.unregister_dwm_preview(key)
-                    widgets["image"].place(x=0, y=0, width=PREVIEW_W, height=PREVIEW_H)
-                    with self.preview_lock:
-                        frame = self.preview_frames.get(key)
-                    photo = self.photo_from_frame(frame) if source["available"] and frame is not None else self.placeholder_image("未启动")
-                    widgets["image"].configure(image=photo)
-                    widgets["image"].image = photo
+                available_w = max(PREVIEW_W, self.source_canvas.winfo_width() - 24)
+                preview_w = min(420, available_w)
+                preview_h = self.preview_height(source, preview_w)
+                widgets["area"].configure(width=preview_w, height=preview_h)
+                self.unregister_dwm_preview(key)
+                widgets["image"].place(x=0, y=0, width=preview_w, height=preview_h)
+                with self.preview_lock:
+                    frame = self.preview_frames.get(key)
+                photo = self.photo_from_frame(frame, preview_w, preview_h) if source["available"] and frame is not None else self.placeholder_image("未启动", preview_w, preview_h)
+                widgets["image"].configure(image=photo)
+                widgets["image"].image = photo
                 widgets["name"].configure(text=source["name"] if source["available"] else f"{source['name']}（未启动）")
         except Exception:
             pass
@@ -1220,6 +1301,12 @@ class App:
         record = self.dwm_thumbs.pop(key, None)
         if record:
             dwm_unregister(record["thumb"])
+
+    def preview_height(self, source, width):
+        data = source.get("source") or {}
+        src_w = max(1, int(data.get("width", PREVIEW_W) or PREVIEW_W))
+        src_h = max(1, int(data.get("height", PREVIEW_H) or PREVIEW_H))
+        return max(80, min(260, int(width * src_h / src_w)))
 
     def visible_preview_rect(self, widget):
         if self.root.state() in {"withdrawn", "iconic"} or not widget.winfo_viewable():
@@ -1269,6 +1356,9 @@ class App:
 
             with mss() as sct:
                 while not self.close_event.is_set():
+                    if time.time() < self.resize_active_until:
+                        time.sleep(0.05)
+                        continue
                     with self.preview_lock:
                         sources = [dict(item) for item in self.preview_sources]
                     for source in sources:
@@ -1295,16 +1385,14 @@ class App:
         except Exception:
             return None
 
-    def photo_from_frame(self, frame):
+    def photo_from_frame(self, frame, width=PREVIEW_W, height=PREVIEW_H):
         img = Image.fromarray(frame).convert("RGB")
-        width, height = PREVIEW_W, PREVIEW_H
         img.thumbnail((width, height))
         canvas = Image.new("RGB", (width, height), (245, 245, 245))
         canvas.paste(img, ((width - img.width) // 2, (height - img.height) // 2))
         return ImageTk.PhotoImage(canvas)
 
-    def placeholder_image(self, text):
-        width, height = PREVIEW_W, PREVIEW_H
+    def placeholder_image(self, text, width=PREVIEW_W, height=PREVIEW_H):
         canvas = Image.new("RGB", (width, height), (54, 58, 64))
         draw = ImageDraw.Draw(canvas)
         draw.text((14, height // 2 - 8), text, fill=(235, 235, 235))
@@ -1331,7 +1419,7 @@ class App:
             card.grid_propagate(False)
             enabled_var = BooleanVar(value=target.get("enabled", True))
             self.target_vars.append(enabled_var)
-            check = ttk.Checkbutton(card, variable=enabled_var, text="匹配", command=lambda i=idx, v=enabled_var: self.toggle_target(i, v))
+            check = self.make_check(card, enabled_var, "匹配", command=lambda i=idx, v=enabled_var: self.toggle_target(i, v))
             check.pack(anchor="w", padx=4, pady=(3, 0))
             thumb = self.make_thumb(target)
             self.thumb_refs.append(thumb)
@@ -1362,6 +1450,7 @@ class App:
                 "layout": {
                     "geometry": self.root.geometry(),
                     "main_ratio": self.main_ratio,
+                    "right_ratio": self.right_ratio,
                     "left_ratio": self.left_ratio,
                 },
                 "max_alerts": self.max_alerts.get(),
@@ -1373,13 +1462,17 @@ class App:
             root_w = max(1, self.root.winfo_width())
             root_h = max(1, self.root.winfo_height())
             self.main_ratio = min(0.85, max(0.45, self.main_pane.sash_coord(0)[0] / root_w))
+            self.right_ratio = min(0.8, max(0.25, (self.main_pane.sash_coord(1)[0] - self.main_pane.sash_coord(0)[0]) / root_w))
             self.left_ratio = min(0.8, max(0.25, self.left_pane.sash_coord(0)[1] / root_h))
         except Exception:
             pass
 
     def restore_layout(self):
         try:
-            self.main_pane.sash_place(0, int(self.root.winfo_width() * self.main_ratio), 0)
+            width = self.root.winfo_width()
+            first = int(width * self.main_ratio)
+            self.main_pane.sash_place(0, first, 0)
+            self.main_pane.sash_place(1, first + int(width * self.right_ratio), 0)
             self.left_pane.sash_place(0, 0, int(self.root.winfo_height() * self.left_ratio))
         except Exception:
             pass
@@ -1525,9 +1618,14 @@ class App:
     def on_resize(self, event):
         if event.widget != self.root:
             return
+        size = (event.width, event.height)
+        if size == self.last_root_size:
+            return
+        self.last_root_size = size
+        self.resize_active_until = time.time() + 0.3
         if self.resize_job:
             self.root.after_cancel(self.resize_job)
-        self.resize_job = self.root.after(450, self.apply_scale)
+        self.resize_job = self.root.after(120, self.apply_scale)
 
     def apply_scale(self):
         self.resize_job = None
@@ -1535,7 +1633,6 @@ class App:
         height = max(1, self.root.winfo_height())
         scale = max(0.8, min(1.8, ((width * height) / (980 * 680)) ** 0.5))
         if abs(scale - self.last_scale) < 0.08:
-            self.restore_layout()
             return
         self.last_scale = scale
         for name, font in self.fonts.items():
@@ -1543,6 +1640,7 @@ class App:
         self.style.configure("Treeview", rowheight=max(22, int(22 * scale)))
         self.thumb_w = int(128 * scale)
         self.thumb_h = int(88 * scale)
+        self.redraw_checks()
         self.reload_target_list()
         self.restore_layout()
 
@@ -1742,6 +1840,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.smoke_test:
         smoke_test()
+        if getattr(sys, "frozen", False):
+            os._exit(0)
         return 0
     root = Tk()
     App(root)
