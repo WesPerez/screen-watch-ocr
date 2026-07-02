@@ -203,6 +203,24 @@ class CoreTest(unittest.TestCase):
         appmod.App.on_resize(app, event)
         app.root.after.assert_not_called()
 
+    def test_vertical_resize_does_not_reset_horizontal_panes(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.last_root_size = (980, 680)
+        app.resize_width_changed = False
+        app.resize_job = None
+        event = type("Event", (), {"widget": app.root, "width": 980, "height": 720})()
+        appmod.App.on_resize(app, event)
+        self.assertFalse(app.resize_width_changed)
+
+        app.left_ratio = 0.5
+        app.main_pane = mock.Mock()
+        app.left_pane = mock.Mock()
+        app.root.winfo_height.return_value = 720
+        appmod.App.restore_layout(app, horizontal=False)
+        app.main_pane.sash_place.assert_not_called()
+        app.left_pane.sash_place.assert_called_once_with(0, 0, 360)
+
     def test_preview_height_tracks_source_aspect(self):
         app = object.__new__(appmod.App)
         source = {"source": {"width": 1920, "height": 1080}}

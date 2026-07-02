@@ -655,6 +655,7 @@ class App:
         self.resize_job = None
         self.last_root_size = None
         self.resize_active_until = 0
+        self.resize_width_changed = True
         self.layout_active_until = 0
         self.layout_restore_job = None
         self.monitor_vars = {}
@@ -772,12 +773,13 @@ class App:
         self.left_pane.bind("<B1-Motion>", self.mark_layout_drag)
         self.left_pane.bind("<ButtonRelease-1>", self.end_layout_drag)
 
-        gallery_box = ttk.LabelFrame(self.left_pane, text="匹配图片")
+        gallery_box = ttk.LabelFrame(self.left_pane)
+        gallery_label = ttk.Frame(gallery_box)
+        ttk.Label(gallery_label, text="匹配图片").pack(side="left")
+        self.target_select_btn = ttk.Button(gallery_label, text="全选", width=8, command=self.toggle_all_targets)
+        self.target_select_btn.pack(side="left", padx=(8, 0))
+        gallery_box.configure(labelwidget=gallery_label)
         self.left_pane.add(gallery_box, minsize=170)
-        gallery_bar = ttk.Frame(gallery_box)
-        gallery_bar.pack(fill="x", padx=4, pady=(4, 0))
-        self.target_select_btn = ttk.Button(gallery_bar, text="全选", width=8, command=self.toggle_all_targets)
-        self.target_select_btn.pack(side="right")
         self.target_canvas = Canvas(gallery_box, highlightthickness=0, height=260)
         self.target_canvas.pack(side="left", fill="both", expand=True)
         scroll = ttk.Scrollbar(gallery_box, orient="vertical", command=self.target_canvas.yview)
@@ -1366,14 +1368,16 @@ class App:
         preferred = int(width * min(0.18, max(0.12, self.right_ratio)))
         return max(min_side, min(max_side, preferred))
 
-    def restore_layout(self):
+    def restore_layout(self, horizontal=True, vertical=True):
         try:
-            width = self.root.winfo_width()
-            side_width = self.side_pane_width(width)
-            first = max(360, width - side_width * 2)
-            self.main_pane.sash_place(0, first, 0)
-            self.main_pane.sash_place(1, first + side_width, 0)
-            self.left_pane.sash_place(0, 0, int(self.root.winfo_height() * self.left_ratio))
+            if horizontal:
+                width = self.root.winfo_width()
+                side_width = self.side_pane_width(width)
+                first = max(360, width - side_width * 2)
+                self.main_pane.sash_place(0, first, 0)
+                self.main_pane.sash_place(1, first + side_width, 0)
+            if vertical:
+                self.left_pane.sash_place(0, 0, int(self.root.winfo_height() * self.left_ratio))
         except Exception:
             pass
 
@@ -1519,7 +1523,9 @@ class App:
         size = (event.width, event.height)
         if size == self.last_root_size:
             return
+        old_size = self.last_root_size
         self.last_root_size = size
+        self.resize_width_changed = self.resize_width_changed or old_size is None or event.width != old_size[0]
         self.resize_active_until = time.time() + 0.3
         if self.resize_job:
             self.root.after_cancel(self.resize_job)
@@ -1531,9 +1537,11 @@ class App:
         height = max(1, self.root.winfo_height())
         if (width, height) != self.last_root_size:
             return
+        width_changed = self.resize_width_changed
+        self.resize_width_changed = False
         scale = max(0.8, min(1.8, ((width * height) / (980 * 680)) ** 0.5))
         if abs(scale - self.last_scale) < 0.08:
-            self.restore_layout()
+            self.restore_layout(horizontal=width_changed)
             return
         self.last_scale = scale
         for name, font in self.fonts.items():
@@ -1543,7 +1551,7 @@ class App:
         self.thumb_h = int(88 * scale)
         self.redraw_checks()
         self.reload_target_list()
-        self.restore_layout()
+        self.restore_layout(horizontal=width_changed)
 
     def selected_regions(self):
         return [self.region_for(i) for i, var in self.monitor_vars.items() if var.get()]
