@@ -56,16 +56,13 @@ GW_OWNER = 4
 GWL_EXSTYLE = -20
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 DWMWA_CLOAKED = 14
-DWM_TNP_RECTDESTINATION = 0x1
-DWM_TNP_OPACITY = 0x4
-DWM_TNP_VISIBLE = 0x8
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
 PREVIEW_W = 260
 PREVIEW_H = 150
-SCREEN_PREVIEW_SECONDS = 0.10
+SCREEN_PREVIEW_SECONDS = 0.25
 MIN_SCAN_INTERVAL_MS = 120
-SOURCE_PREVIEW_SYNC_MS = 100
+SOURCE_PREVIEW_SYNC_MS = 500
 
 
 def enable_dpi_awareness():
@@ -113,21 +110,6 @@ class WindowPlacement(ctypes.Structure):
         ("ptMinPosition", wintypes.POINT),
         ("ptMaxPosition", wintypes.POINT),
         ("rcNormalPosition", wintypes.RECT),
-    ]
-
-
-class Size(ctypes.Structure):
-    _fields_ = [("cx", ctypes.c_int), ("cy", ctypes.c_int)]
-
-
-class DwmThumbnailProperties(ctypes.Structure):
-    _fields_ = [
-        ("dwFlags", wintypes.DWORD),
-        ("rcDestination", wintypes.RECT),
-        ("rcSource", wintypes.RECT),
-        ("opacity", ctypes.c_ubyte),
-        ("fVisible", wintypes.BOOL),
-        ("fSourceClientAreaOnly", wintypes.BOOL),
     ]
 
 
@@ -181,14 +163,6 @@ def configure_winapi():
         dwmapi = ctypes.windll.dwmapi
         dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD]
         dwmapi.DwmGetWindowAttribute.restype = ctypes.HRESULT
-        dwmapi.DwmRegisterThumbnail.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.POINTER(wintypes.HANDLE)]
-        dwmapi.DwmRegisterThumbnail.restype = ctypes.HRESULT
-        dwmapi.DwmUnregisterThumbnail.argtypes = [wintypes.HANDLE]
-        dwmapi.DwmUnregisterThumbnail.restype = ctypes.HRESULT
-        dwmapi.DwmUpdateThumbnailProperties.argtypes = [wintypes.HANDLE, ctypes.POINTER(DwmThumbnailProperties)]
-        dwmapi.DwmUpdateThumbnailProperties.restype = ctypes.HRESULT
-        dwmapi.DwmQueryThumbnailSourceSize.argtypes = [wintypes.HANDLE, ctypes.POINTER(Size)]
-        dwmapi.DwmQueryThumbnailSourceSize.restype = ctypes.HRESULT
     except Exception:
         pass
     _WINAPI_READY = True
@@ -622,59 +596,6 @@ def capture_window_frame(sct, hwnd):
     return frame if frame is not None else visible
 
 
-def dwm_register(dest_hwnd, source_hwnd):
-    if os.name != "nt":
-        return None
-    configure_winapi()
-    try:
-        thumb = wintypes.HANDLE()
-        if ctypes.windll.dwmapi.DwmRegisterThumbnail(int(dest_hwnd), int(source_hwnd), ctypes.byref(thumb)) != 0:
-            return None
-        return thumb
-    except Exception:
-        return None
-
-
-def dwm_unregister(thumb):
-    try:
-        if thumb:
-            ctypes.windll.dwmapi.DwmUnregisterThumbnail(thumb)
-    except Exception:
-        pass
-
-
-def dwm_update(thumb, x, y, width, height, visible=True):
-    try:
-        props = DwmThumbnailProperties()
-        props.dwFlags = DWM_TNP_VISIBLE | DWM_TNP_OPACITY
-        props.opacity = 255
-        props.fVisible = bool(visible)
-        if not visible:
-            return ctypes.windll.dwmapi.DwmUpdateThumbnailProperties(thumb, ctypes.byref(props)) == 0
-        src = Size()
-        ctypes.windll.dwmapi.DwmQueryThumbnailSourceSize(thumb, ctypes.byref(src))
-        src_w, src_h = max(1, src.cx), max(1, src.cy)
-        scale = min(width / src_w, height / src_h)
-        dst_w, dst_h = max(1, int(src_w * scale)), max(1, int(src_h * scale))
-        left = int(x + (width - dst_w) // 2)
-        top = int(y + (height - dst_h) // 2)
-        props.dwFlags |= DWM_TNP_RECTDESTINATION
-        props.rcDestination = wintypes.RECT(left, top, left + dst_w, top + dst_h)
-        return ctypes.windll.dwmapi.DwmUpdateThumbnailProperties(thumb, ctypes.byref(props)) == 0
-    except Exception:
-        return False
-
-
-def hwnd_for_tk(window):
-    try:
-        return int(window.frame(), 16)
-    except Exception:
-        try:
-            return int(window.winfo_id())
-        except Exception:
-            return 0
-
-
 def beep_wave(volume, milliseconds=180, frequency=1200, sample_rate=22050):
     volume = parse_volume(volume)
     frames = int(sample_rate * milliseconds / 1000)
@@ -716,7 +637,7 @@ class App:
         self.state = load_json(STATE_PATH, {"last_profile": 1, "layout": {}})
         self.layout = self.state.get("layout", {})
         self.main_ratio = float(self.layout.get("main_ratio", 0.72))
-        self.right_ratio = float(self.layout.get("right_ratio", 0.5))
+        self.right_ratio = min(0.18, max(0.12, float(self.layout.get("right_ratio", 0.16))))
         self.left_ratio = float(self.layout.get("left_ratio", 0.58))
         self.root.geometry(self.layout.get("geometry", "980x680"))
         self.root.minsize(820, 600)
@@ -734,6 +655,7 @@ class App:
         self.resize_job = None
         self.last_root_size = None
         self.resize_active_until = 0
+        self.layout_active_until = 0
         self.layout_restore_job = None
         self.monitor_vars = {}
         self.monitor_info = {}
@@ -743,7 +665,6 @@ class App:
         self.window_choice = StringVar(value="选择应用...")
         self.window_refresh_job = None
         self.source_widgets = {}
-        self.dwm_thumbs = {}
         self.preview_sources = []
         self.preview_frames = {}
         self.preview_lock = threading.Lock()
@@ -779,7 +700,6 @@ class App:
         self.check_widgets = []
         self._build()
         self.refresh_monitors()
-        self.refresh_windows()
         self.load_profile(self.current_profile)
         self.root.bind_all("<Control-v>", self.handle_paste_hotkey)
         self.root.bind_all("<Control-V>", self.handle_paste_hotkey)
@@ -813,7 +733,9 @@ class App:
         self.main_pane.add(left, minsize=360)
         self.main_pane.add(right_outer, minsize=260)
         self.main_pane.add(preview_outer, minsize=260)
-        self.main_pane.bind("<ButtonRelease-1>", lambda _event: self.capture_layout_ratios())
+        self.main_pane.bind("<ButtonPress-1>", self.begin_layout_drag)
+        self.main_pane.bind("<B1-Motion>", self.mark_layout_drag)
+        self.main_pane.bind("<ButtonRelease-1>", self.end_layout_drag)
 
         preview_box = ttk.LabelFrame(preview_outer, text="来源预览")
         preview_box.pack(fill="both", expand=True)
@@ -846,7 +768,9 @@ class App:
 
         self.left_pane = PanedWindow(left, orient="vertical", sashwidth=8, sashrelief="raised", bd=0)
         self.left_pane.pack(fill="both", expand=True, pady=(10, 0))
-        self.left_pane.bind("<ButtonRelease-1>", lambda _event: self.capture_layout_ratios())
+        self.left_pane.bind("<ButtonPress-1>", self.begin_layout_drag)
+        self.left_pane.bind("<B1-Motion>", self.mark_layout_drag)
+        self.left_pane.bind("<ButtonRelease-1>", self.end_layout_drag)
 
         gallery_box = ttk.LabelFrame(self.left_pane, text="匹配图片")
         self.left_pane.add(gallery_box, minsize=170)
@@ -1019,6 +943,19 @@ class App:
     def scroll_right(self, event):
         self.right_canvas.yview_scroll(int(-event.delta / 120), "units")
         return "break"
+
+    def begin_layout_drag(self, _event=None):
+        self.layout_active_until = time.time() + 0.8
+
+    def mark_layout_drag(self, _event=None):
+        self.layout_active_until = time.time() + 0.8
+
+    def end_layout_drag(self, _event=None):
+        self.layout_active_until = time.time() + 0.3
+        self.capture_layout_ratios()
+
+    def layout_busy(self):
+        return time.time() < max(self.resize_active_until, self.layout_active_until)
 
     def refresh_monitors(self):
         selected = {i for i, var in self.monitor_vars.items() if var.get()}
@@ -1237,6 +1174,8 @@ class App:
 
     def refresh_source_previews(self):
         try:
+            if self.layout_busy():
+                return
             sources = []
             for monitor in self.selected_regions():
                 sources.append({"key": f"screen:{monitor['name']}", "kind": "screen", "name": monitor["name"], "source": self.preview_screen_source(monitor), "available": True})
@@ -1249,7 +1188,6 @@ class App:
                 self.preview_sources = [dict(item) for item in sources]
             for key in list(self.source_widgets):
                 if key not in source_keys:
-                    self.unregister_dwm_preview(key)
                     self.source_widgets[key]["frame"].destroy()
                     del self.source_widgets[key]
                     with self.preview_lock:
@@ -1281,11 +1219,13 @@ class App:
                 preview_w = min(420, available_w)
                 preview_h = self.preview_height(source, preview_w)
                 widgets["area"].configure(width=preview_w, height=preview_h)
-                self.unregister_dwm_preview(key)
                 widgets["image"].place(x=0, y=0, width=preview_w, height=preview_h)
                 with self.preview_lock:
                     frame = self.preview_frames.get(key)
-                photo = self.photo_from_frame(frame, preview_w, preview_h) if source["available"] and frame is not None else self.placeholder_image("未启动", preview_w, preview_h)
+                if source["available"] and frame is not None:
+                    photo = self.photo_from_frame(frame, preview_w, preview_h)
+                else:
+                    photo = self.placeholder_image("等待画面" if source["available"] else "未启动", preview_w, preview_h)
                 widgets["image"].configure(image=photo)
                 widgets["image"].image = photo
                 widgets["name"].configure(text=source["name"] if source["available"] else f"{source['name']}（未启动）")
@@ -1297,58 +1237,11 @@ class App:
             except TclError:
                 pass
 
-    def unregister_dwm_preview(self, key):
-        record = self.dwm_thumbs.pop(key, None)
-        if record:
-            dwm_unregister(record["thumb"])
-
     def preview_height(self, source, width):
         data = source.get("source") or {}
         src_w = max(1, int(data.get("width", PREVIEW_W) or PREVIEW_W))
         src_h = max(1, int(data.get("height", PREVIEW_H) or PREVIEW_H))
         return max(80, min(260, int(width * src_h / src_w)))
-
-    def visible_preview_rect(self, widget):
-        if self.root.state() in {"withdrawn", "iconic"} or not widget.winfo_viewable():
-            return None
-        self.root.update_idletasks()
-        x, y = widget.winfo_rootx(), widget.winfo_rooty()
-        w, h = widget.winfo_width() or PREVIEW_W, widget.winfo_height() or PREVIEW_H
-        bounds = [
-            (self.root.winfo_rootx(), self.root.winfo_rooty(), self.root.winfo_rootx() + self.root.winfo_width(), self.root.winfo_rooty() + self.root.winfo_height()),
-            (self.source_canvas.winfo_rootx(), self.source_canvas.winfo_rooty(), self.source_canvas.winfo_rootx() + self.source_canvas.winfo_width(), self.source_canvas.winfo_rooty() + self.source_canvas.winfo_height()),
-        ]
-        if any(x < left or y < top or x + w > right or y + h > bottom for left, top, right, bottom in bounds):
-            return None
-        return x, y, w, h
-
-    def sync_dwm_preview(self, key, widget, hwnd):
-        rect = self.visible_preview_rect(widget)
-        record = self.dwm_thumbs.get(key)
-        if rect is None:
-            if record:
-                dwm_update(record["thumb"], 0, 0, 1, 1, visible=False)
-                record["rect"] = None
-            return True
-        x, y, width, height = rect
-        root_hwnd = hwnd_for_tk(self.root)
-        rel = (x - self.root.winfo_rootx(), y - self.root.winfo_rooty(), width, height)
-        if not record or record.get("hwnd") != hwnd or record.get("root") != root_hwnd:
-            self.unregister_dwm_preview(key)
-            thumb = dwm_register(root_hwnd, hwnd)
-            if not thumb:
-                return False
-            self.dwm_thumbs[key] = {"thumb": thumb, "hwnd": hwnd, "root": root_hwnd, "rect": None}
-            record = self.dwm_thumbs[key]
-        try:
-            if record.get("rect") != rel:
-                ok = dwm_update(record["thumb"], rel[0], rel[1], rel[2], rel[3], visible=True)
-                if ok:
-                    record["rect"] = rel
-                return ok
-            return True
-        except Exception:
-            return False
 
     def run_preview_worker(self):
         try:
@@ -1356,7 +1249,7 @@ class App:
 
             with mss() as sct:
                 while not self.close_event.is_set():
-                    if time.time() < self.resize_active_until:
+                    if self.layout_busy():
                         time.sleep(0.05)
                         continue
                     with self.preview_lock:
@@ -1365,7 +1258,7 @@ class App:
                         if self.close_event.is_set():
                             return
                         frame = self.capture_preview_frame(sct, source)
-                        if frame is not None:
+                        if frame is not None and not mostly_black(frame):
                             with self.preview_lock:
                                 self.preview_frames[source["key"]] = frame
                     time.sleep(SCREEN_PREVIEW_SECONDS)
@@ -1462,17 +1355,24 @@ class App:
             root_w = max(1, self.root.winfo_width())
             root_h = max(1, self.root.winfo_height())
             self.main_ratio = min(0.85, max(0.45, self.main_pane.sash_coord(0)[0] / root_w))
-            self.right_ratio = min(0.8, max(0.25, (self.main_pane.sash_coord(1)[0] - self.main_pane.sash_coord(0)[0]) / root_w))
+            self.right_ratio = min(0.18, max(0.12, (self.main_pane.sash_coord(1)[0] - self.main_pane.sash_coord(0)[0]) / root_w))
             self.left_ratio = min(0.8, max(0.25, self.left_pane.sash_coord(0)[1] / root_h))
         except Exception:
             pass
 
+    def side_pane_width(self, width):
+        max_side = max(180, min(360, (int(width) - 360) // 2))
+        min_side = min(260, max_side)
+        preferred = int(width * min(0.18, max(0.12, self.right_ratio)))
+        return max(min_side, min(max_side, preferred))
+
     def restore_layout(self):
         try:
             width = self.root.winfo_width()
-            first = int(width * self.main_ratio)
+            side_width = self.side_pane_width(width)
+            first = max(360, width - side_width * 2)
             self.main_pane.sash_place(0, first, 0)
-            self.main_pane.sash_place(1, first + int(width * self.right_ratio), 0)
+            self.main_pane.sash_place(1, first + side_width, 0)
             self.left_pane.sash_place(0, 0, int(self.root.winfo_height() * self.left_ratio))
         except Exception:
             pass
@@ -1548,8 +1448,6 @@ class App:
         self.save_state()
         self.stop_event.set()
         self.close_event.set()
-        for key in list(self.dwm_thumbs):
-            self.unregister_dwm_preview(key)
         if self.tray_icon:
             self.tray_icon.stop()
             self.tray_icon = None
@@ -1631,8 +1529,11 @@ class App:
         self.resize_job = None
         width = max(1, self.root.winfo_width())
         height = max(1, self.root.winfo_height())
+        if (width, height) != self.last_root_size:
+            return
         scale = max(0.8, min(1.8, ((width * height) / (980 * 680)) ** 0.5))
         if abs(scale - self.last_scale) < 0.08:
+            self.restore_layout()
             return
         self.last_scale = scale
         for name, font in self.fonts.items():

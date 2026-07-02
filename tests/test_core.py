@@ -208,6 +208,24 @@ class CoreTest(unittest.TestCase):
         source = {"source": {"width": 1920, "height": 1080}}
         self.assertEqual(appmod.App.preview_height(app, source, 260), 146)
 
+    def test_side_panes_stay_equal_and_bounded(self):
+        app = object.__new__(appmod.App)
+        app.right_ratio = 0.5
+        self.assertEqual(appmod.App.side_pane_width(app, 2388), 360)
+        app.right_ratio = 0.16
+        self.assertEqual(appmod.App.side_pane_width(app, 1453), 260)
+
+    def test_layout_busy_covers_resize_and_pane_drag(self):
+        app = object.__new__(appmod.App)
+        app.resize_active_until = 0
+        app.layout_active_until = 0
+        self.assertFalse(appmod.App.layout_busy(app))
+        appmod.App.begin_layout_drag(app)
+        self.assertTrue(appmod.App.layout_busy(app))
+        app.layout_active_until = 0
+        app.resize_active_until = appmod.time.time() + 1
+        self.assertTrue(appmod.App.layout_busy(app))
+
     def test_show_window_keeps_existing_tray_icon(self):
         root = appmod.Tk()
         try:
