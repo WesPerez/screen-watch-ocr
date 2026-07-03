@@ -251,10 +251,19 @@ def ps_quote(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def offscreen_geometry(geometry):
+    match = re.match(r"^(\d+x\d+)", str(geometry or ""))
+    return f"{match.group(1) if match else '980x680'}+-32000+-32000"
+
+
 def shortcut_target(path):
+    return shortcut_info(path).get("target", "")
+
+
+def shortcut_info(path):
     if os.name != "nt" or not Path(path).exists():
-        return ""
-    script = f"$s=New-Object -ComObject WScript.Shell; $l=$s.CreateShortcut({ps_quote(path)}); Write-Output $l.TargetPath"
+        return {}
+    script = f"$s=New-Object -ComObject WScript.Shell; $l=$s.CreateShortcut({ps_quote(path)}); Write-Output $l.TargetPath; Write-Output $l.Arguments"
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
         capture_output=True,
@@ -262,7 +271,28 @@ def shortcut_target(path):
         creationflags=subprocess_flags(),
         timeout=10,
     )
-    return result.stdout.strip() if result.returncode == 0 else ""
+    if result.returncode != 0:
+        return {}
+    lines = result.stdout.splitlines()
+    return {"target": lines[0].strip() if lines else "", "arguments": lines[1].strip() if len(lines) > 1 else ""}
+
+
+def startup_arguments(target=None):
+    target = Path(target or app_target_path())
+    if not getattr(sys, "frozen", False):
+        try:
+            if target.resolve() == Path(sys.executable).resolve():
+                return "-m screen_watch app --start-minimized"
+        except Exception:
+            pass
+    if target.suffix.lower() == ".py":
+        return "-m screen_watch app --start-minimized"
+    return "--start-minimized"
+
+
+def startup_working_dir(target=None):
+    target = Path(target or app_target_path())
+    return APP_DIR if target == Path(sys.executable) and not getattr(sys, "frozen", False) else target.parent
 
 
 def is_startup_enabled(target=None):
@@ -281,12 +311,14 @@ def set_startup_enabled(enabled, target=None):
     target = Path(target or app_target_path()).resolve()
     if enabled:
         link.parent.mkdir(parents=True, exist_ok=True)
+        arguments = startup_arguments(target)
+        working_dir = startup_working_dir(target)
         script = (
             "$s=New-Object -ComObject WScript.Shell; "
             f"$l=$s.CreateShortcut({ps_quote(link)}); "
             f"$l.TargetPath={ps_quote(target)}; "
-            "$l.Arguments=''; "
-            f"$l.WorkingDirectory={ps_quote(target.parent)}; "
+            f"$l.Arguments={ps_quote(arguments)}; "
+            f"$l.WorkingDirectory={ps_quote(working_dir)}; "
             "$l.Save()"
         )
         result = subprocess.run(
@@ -303,6 +335,16 @@ def set_startup_enabled(enabled, target=None):
     elif link.exists() and is_startup_enabled(target):
         link.unlink()
     return is_startup_enabled(target)
+
+
+def refresh_startup_shortcut_if_needed():
+    if not is_startup_enabled():
+        return False
+    info = shortcut_info(startup_link_path())
+    if info.get("arguments", "") != startup_arguments():
+        set_startup_enabled(True)
+        return True
+    return False
 
 
 def migrate_legacy_data():
@@ -386,6 +428,33 @@ def template_suffix(name):
     return match.group(3) if match else template_stamp()
 
 
+def target_identity(target):
+    if target.get("id"):
+        return str(target["id"])
+    for key in ("path", "name"):
+        stem = Path(str(target.get(key, ""))).stem
+        match = TEMPLATE_NAME_RE.match(stem)
+        if match:
+            return match.group(3)
+    return str(target.get("name") or Path(str(target.get("path", "target"))).stem or template_stamp())
+
+
+def ensure_target_metadata(target):
+    updated = dict(target)
+    changed = False
+    if not updated.get("id"):
+        updated["id"] = target_identity(updated)
+        changed = True
+    try:
+        count = max(0, int(updated.get("hit_count", 0) or 0))
+    except (TypeError, ValueError):
+        count = 0
+    if updated.get("hit_count") != count:
+        updated["hit_count"] = count
+        changed = True
+    return updated, changed
+
+
 def available_template_name(profile, count, suffix, current_path=None, current_thumb=None):
     target_dir = DATA_DIR / "templates"
     current_path = Path(current_path).resolve() if current_path else None
@@ -450,9 +519,10 @@ def delete_target_files(target):
 
 
 def rename_target(target, profile, count):
+    target, metadata_changed = ensure_target_metadata(target)
     path = Path(target.get("path", ""))
     if not path.exists() or not is_under(path, DATA_DIR / "templates"):
-        return target, False
+        return target, metadata_changed
     old_name = target.get("name")
     thumb = Path(target.get("thumb", ""))
     old_path = path.resolve()
@@ -480,7 +550,7 @@ def rename_target(target, profile, count):
             target["thumb"] = str(save_thumb(image, new_path))
         changed = True
     target["name"] = stem
-    return target, changed or old_name != stem
+    return target, changed or old_name != stem or metadata_changed
 
 
 def normalize_target_names(targets, profile):
@@ -563,6 +633,16 @@ def window_class(hwnd):
         return ""
 
 
+def window_is_minimized(hwnd):
+    if os.name != "nt":
+        return False
+    configure_winapi()
+    try:
+        return bool(ctypes.windll.user32.IsIconic(int(hwnd)))
+    except Exception:
+        return False
+
+
 def list_app_windows():
     if os.name != "nt":
         return []
@@ -596,13 +676,21 @@ def list_app_windows():
             return True
         if window_class(hwnd) in {"Windows.UI.Core.CoreWindow", "ApplicationFrameInputSinkWindow"}:
             return True
-        rect = wintypes.RECT()
-        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-            return True
+        minimized = bool(user32.IsIconic(hwnd))
+        if minimized:
+            placement = WindowPlacement()
+            placement.length = ctypes.sizeof(WindowPlacement)
+            if not user32.GetWindowPlacement(hwnd, ctypes.byref(placement)):
+                return True
+            rect = placement.rcNormalPosition
+        else:
+            rect = wintypes.RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return True
         width, height = rect.right - rect.left, rect.bottom - rect.top
         if width < 40 or height < 40:
             return True
-        windows.append({"hwnd": int(hwnd), "title": text, "width": width, "height": height})
+        windows.append({"hwnd": int(hwnd), "title": text, "width": width, "height": height, "minimized": minimized})
         return True
 
     user32.EnumWindows(enum_proc, 0)
@@ -715,6 +803,8 @@ def crop_black_padding(frame, threshold=8):
 
 
 def capture_window_visible(sct, hwnd):
+    if window_is_minimized(hwnd):
+        return None
     info = window_rect(hwnd)
     if not info:
         return None
@@ -725,7 +815,8 @@ def capture_window_visible(sct, hwnd):
 
 def capture_window_frame(sct, hwnd, mode_cache=None):
     mode_key = int(hwnd)
-    if mode_cache and mode_cache.get(mode_key) == "visible":
+    minimized = window_is_minimized(hwnd)
+    if mode_cache and mode_cache.get(mode_key) == "visible" and not minimized:
         visible = capture_window_visible(sct, hwnd)
         if visible is not None and not mostly_black(visible):
             return visible
@@ -736,6 +827,8 @@ def capture_window_frame(sct, hwnd, mode_cache=None):
         frame = crop_black_padding(frame)
     if not mostly_black(frame) and black_fraction(frame) < 0.25:
         return frame
+    if minimized:
+        return None
     visible = capture_window_visible(sct, hwnd)
     if visible is not None and not mostly_black(visible):
         if frame is None or mostly_black(frame) or black_fraction(visible) + 0.1 < black_fraction(frame):
@@ -866,6 +959,8 @@ class App:
         self.thumb_h = 72
         self.last_scale = 1.0
         self.resize_job = None
+        self.resize_shell = None
+        self.resize_shell_active = False
         self.last_root_size = None
         self.resize_active_until = 0
         self.move_active_until = 0
@@ -888,16 +983,22 @@ class App:
         self.preview_lock = threading.Lock()
         self.preview_job = None
         self.source_previews_enabled = False
+        self.layout_paused_previews = False
         self.dwm_sync_job = None
         self.worker = None
         self.tray_icon = None
+        self.background_tasks_started = False
+        self.ui_ready = False
         self.stop_event = threading.Event()
         self.close_event = threading.Event()
         self.beep_lock = threading.Lock()
         self.beep_until = 0
         self.events = queue.Queue()
         self.profile = IntVar(value=self.current_profile)
-        self.startup_enabled = BooleanVar(value=is_startup_enabled())
+        startup_enabled = is_startup_enabled()
+        if startup_enabled:
+            refresh_startup_shortcut_if_needed()
+        self.startup_enabled = BooleanVar(value=startup_enabled)
         self.threshold = DoubleVar(value=0.90)
         self.scales = StringVar(value="1.0")
         self.interval_ms = IntVar(value=250)
@@ -927,12 +1028,6 @@ class App:
         self.root.bind_all("<Control-V>", self.handle_paste_hotkey)
         self.root.bind("<Configure>", self.on_resize)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        threading.Thread(target=self.run_preview_worker, daemon=True).start()
-        self.root.after(250, self.restore_layout)
-        self.root.after(1000, self.refresh_windows_loop)
-        self.root.after(100, self.poll_events)
-        if self.root.state() != "withdrawn":
-            self.ensure_tray_icon(show_errors=False)
 
     def _build(self):
         self.main_pane = PanedWindow(
@@ -947,6 +1042,8 @@ class App:
             proxyrelief="flat",
         )
         self.main_pane.pack(fill="both", expand=True, padx=12, pady=12)
+        self.resize_shell = ttk.Frame(self.root)
+        ttk.Label(self.resize_shell, text="调整窗口中...").pack(expand=True)
         left = ttk.Frame(self.main_pane)
         right_outer = ttk.Frame(self.main_pane, width=300)
         preview_outer = ttk.Frame(self.main_pane, width=380)
@@ -1178,7 +1275,7 @@ class App:
 
     def begin_layout_drag(self, _event=None):
         self.layout_active_until = time.time() + 0.8
-        self.suspend_dwm_previews()
+        self.pause_source_previews_for_layout()
 
     def mark_layout_drag(self, _event=None):
         self.layout_active_until = time.time() + 0.8
@@ -1186,11 +1283,11 @@ class App:
     def end_layout_drag(self, _event=None):
         self.layout_active_until = 0
         self.save_state()
-        self.schedule_source_previews(0)
+        self.resume_source_previews_after_layout(0)
 
     def layout_busy(self):
         active_until = max(getattr(self, "resize_active_until", 0), getattr(self, "layout_active_until", 0), getattr(self, "move_active_until", 0))
-        return self.mouse_button_down() or time.time() < active_until
+        return getattr(self, "resize_shell_active", False) or self.mouse_button_down() or time.time() < active_until
 
     def mouse_button_down(self):
         if os.name != "nt":
@@ -1219,7 +1316,7 @@ class App:
         self.window_choices = list_app_windows()
         self.window_info = {item["key"]: item for item in self.window_choices}
         selected = {self.app_key(app) for app in self.selected_apps}
-        values = [("✓ " if item["key"] in selected else "") + item["display"] for item in self.window_choices]
+        values = [("✓ " if item["key"] in selected else "") + self.window_label(item) for item in self.window_choices]
         self.window_combo.configure(values=values)
         self.window_choice.set("选择应用...")
         self.reload_selected_apps()
@@ -1233,6 +1330,9 @@ class App:
 
     def app_key(self, app):
         return window_key(app.get("title", ""), app.get("ordinal", 1))
+
+    def window_label(self, item):
+        return item["display"] + ("（最小化）" if item.get("minimized") else "")
 
     def add_selected_app(self, item):
         app = {"title": item["title"], "ordinal": item.get("ordinal", 1)}
@@ -1249,7 +1349,7 @@ class App:
 
     def toggle_window_choice(self, _event=None):
         value = self.window_choice.get()
-        index = next((i for i, item in enumerate(self.window_choices) if value == item["display"] or value == "✓ " + item["display"]), None)
+        index = next((i for i, item in enumerate(self.window_choices) if value in {item["display"], self.window_label(item), "✓ " + item["display"], "✓ " + self.window_label(item)}), None)
         if index is None:
             self.window_choice.set("选择应用...")
             return
@@ -1285,7 +1385,7 @@ class App:
             key = self.app_key(app)
             info = self.window_info.get(key)
             title = info["display"] if info else window_display(app["title"], app.get("ordinal", 1), app.get("ordinal", 1) > 1)
-            text = title if info else f"{title}（未启动）"
+            text = self.window_label(info) if info else f"{title}（未启动）"
             record = widgets.get(key)
             if not record:
                 row = ttk.Frame(self.selected_app_frame)
@@ -1353,7 +1453,8 @@ class App:
         thumb = save_thumb(image, path)
         with Image.open(path) as saved:
             width, height = saved.size
-        self.targets.append({"name": path.stem, "path": str(path), "thumb": str(thumb), "size": f"{width}x{height}", "enabled": True})
+        target, _changed = ensure_target_metadata({"name": path.stem, "path": str(path), "thumb": str(thumb), "size": f"{width}x{height}", "enabled": True})
+        self.targets.append(target)
         self.selected_target = len(self.targets) - 1
         self.reload_target_list()
         self.save_current_profile()
@@ -1377,7 +1478,8 @@ class App:
     def make_thumb(self, target):
         path = target.get("thumb") or target["path"]
         mtime = Path(path).stat().st_mtime if Path(path).exists() else 0
-        key = (str(path), mtime, self.thumb_w, self.thumb_h)
+        hit_count = max(0, int(target.get("hit_count", 0) or 0))
+        key = (str(path), mtime, self.thumb_w, self.thumb_h, hit_count)
         if key in self.thumb_cache:
             return self.thumb_cache[key]
         with Image.open(path) as opened:
@@ -1385,8 +1487,30 @@ class App:
         img.thumbnail((self.thumb_w, self.thumb_h))
         canvas = Image.new("RGB", (self.thumb_w, self.thumb_h), (245, 245, 245))
         canvas.paste(img, ((self.thumb_w - img.width) // 2, (self.thumb_h - img.height) // 2))
+        if hit_count:
+            self.draw_count_badge(canvas, hit_count)
         self.thumb_cache[key] = ImageTk.PhotoImage(canvas)
         return self.thumb_cache[key]
+
+    def draw_count_badge(self, image, count):
+        draw = ImageDraw.Draw(image)
+        text = str(count)
+        try:
+            bbox = draw.textbbox((0, 0), text)
+            text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        except Exception:
+            text_w, text_h = draw.textsize(text)
+        pad_x, pad_y = 5, 2
+        w = max(18, text_w + pad_x * 2)
+        h = max(16, text_h + pad_y * 2)
+        x2 = image.width - 4
+        y1 = 4
+        box = (x2 - w, y1, x2, y1 + h)
+        try:
+            draw.rounded_rectangle(box, radius=7, fill=(220, 38, 38), outline=(255, 255, 255), width=1)
+        except Exception:
+            draw.rectangle(box, fill=(220, 38, 38), outline=(255, 255, 255))
+        draw.text((box[0] + (w - text_w) // 2, box[1] + (h - text_h) // 2 - 1), text, fill=(255, 255, 255))
 
     def select_target(self, index):
         old = getattr(self, "selected_target", None)
@@ -1494,8 +1618,16 @@ class App:
                 sources.append({"key": f"screen:{monitor['name']}", "kind": "screen", "name": monitor["name"], "source": self.preview_screen_source(monitor), "available": True})
             for app in self.selected_apps:
                 item = self.window_info.get(self.app_key(app))
-                name = item["display"] if item else window_display(app["title"], app.get("ordinal", 1), app.get("ordinal", 1) > 1)
-                sources.append({"key": f"app:{self.app_key(app)}", "kind": "window", "name": name, "source": item, "available": bool(item), "dwm": bool(item and os.name == "nt")})
+                name = self.window_label(item) if item else window_display(app["title"], app.get("ordinal", 1), app.get("ordinal", 1) > 1)
+                sources.append({
+                    "key": f"app:{self.app_key(app)}",
+                    "kind": "window",
+                    "name": name,
+                    "source": item,
+                    "available": bool(item),
+                    "minimized": bool(item and item.get("minimized")),
+                    "dwm": bool(item and os.name == "nt" and not item.get("minimized")),
+                })
             for source in sources:
                 source["signature"] = self.preview_signature(source)
             source_keys = {item["key"] for item in sources}
@@ -1559,7 +1691,8 @@ class App:
                             widgets["photo_frame_id"] = frame_id
                             widgets["photo_size"] = size
                     elif not layout_busy or not getattr(widgets["image"], "image", None):
-                        photo = self.placeholder_image("等待画面" if source["available"] else "未启动", preview_w, preview_h)
+                        placeholder = "已最小化" if source.get("minimized") else "等待画面" if source["available"] else "未启动"
+                        photo = self.placeholder_image(placeholder, preview_w, preview_h)
                         widgets["image"].configure(image=photo)
                         widgets["image"].image = photo
                         widgets["photo_frame_id"] = None
@@ -1595,6 +1728,58 @@ class App:
     def suspend_dwm_previews(self):
         for key in list(getattr(self, "dwm_thumbs", {})):
             self.unregister_dwm_preview(key)
+
+    def pause_source_previews_for_layout(self):
+        if getattr(self, "source_previews_enabled", False):
+            self.disable_source_previews()
+            self.layout_paused_previews = True
+
+    def resume_source_previews_after_layout(self, delay=0):
+        if getattr(self, "layout_paused_previews", False):
+            self.layout_paused_previews = False
+            self.enable_source_previews(delay)
+        else:
+            self.schedule_source_previews(delay)
+
+    def start_background_tasks(self):
+        if self.background_tasks_started:
+            return
+        self.background_tasks_started = True
+        threading.Thread(target=self.run_preview_worker, daemon=True).start()
+        self.root.after(1000, self.refresh_windows_loop)
+        self.root.after(100, self.poll_events)
+
+    def begin_outer_resize(self):
+        if not getattr(self, "ui_ready", True) or getattr(self, "resize_shell_active", False):
+            return
+        if not hasattr(self, "main_pane") or not hasattr(self, "resize_shell"):
+            return
+        self.pause_source_previews_for_layout()
+        self.resize_shell_active = True
+        try:
+            self.main_pane.pack_forget()
+            self.resize_shell.pack(fill="both", expand=True, padx=12, pady=12)
+        except TclError:
+            pass
+
+    def finish_outer_resize(self):
+        self.resize_job = None
+        if getattr(self, "mouse_button_down", lambda: False)():
+            self.resize_active_until = time.time() + 0.3
+            self.resize_job = self.root.after(120, self.finish_outer_resize)
+            return
+        if getattr(self, "resize_shell_active", False):
+            self.resize_shell_active = False
+            try:
+                self.resize_shell.pack_forget()
+                self.main_pane.pack(fill="both", expand=True, padx=12, pady=12)
+            except TclError:
+                pass
+            self.root.update_idletasks()
+        self.apply_scale(force=True)
+        self.restore_layout()
+        self.resize_active_until = 0
+        self.resume_source_previews_after_layout(160)
 
     def schedule_source_previews(self, delay):
         if getattr(self, "preview_job", None):
@@ -2013,12 +2198,20 @@ class App:
     def show_window(self):
         self.ensure_tray_icon(show_errors=False)
         self.disable_source_previews()
+        was_hidden = self.root.state() in {"withdrawn", "iconic"}
         self.root.deiconify()
         self.root.lift()
         try:
             self.root.focus_force()
         except TclError:
             pass
+        if was_hidden or not getattr(self, "ui_ready", False):
+            self.root.update_idletasks()
+            self.last_root_size = (max(1, self.root.winfo_width()), max(1, self.root.winfo_height()))
+            self.apply_scale(force=True)
+            self.restore_layout()
+            self.root.update_idletasks()
+            self.ui_ready = True
         self.enable_source_previews(250)
 
     def start_instance_listener(self, sock):
@@ -2070,12 +2263,16 @@ class App:
         if size == self.last_root_size:
             self.move_active_until = time.time() + 0.3
             return
-        self.suspend_dwm_previews()
+        if not getattr(self, "ui_ready", True):
+            self.last_root_size = size
+            return
+        self.begin_outer_resize()
+        self.pause_source_previews_for_layout()
         self.last_root_size = size
         self.resize_active_until = time.time() + 0.3
         if self.resize_job:
             self.root.after_cancel(self.resize_job)
-        self.resize_job = self.root.after(120, self.apply_scale)
+        self.resize_job = self.root.after(180, self.finish_outer_resize)
 
     def apply_scale(self, force=False):
         self.resize_job = None
@@ -2088,7 +2285,7 @@ class App:
             return
         scale = max(0.8, min(1.35, ((width * height) / (980 * 680)) ** 0.5))
         if not force and abs(scale - self.last_scale) < 0.08:
-            self.schedule_source_previews(0)
+            self.resume_source_previews_after_layout(80)
             return
         self.last_scale = scale
         for name, font in self.fonts.items():
@@ -2100,7 +2297,7 @@ class App:
         self.thumb_h = int(72 * scale)
         self.redraw_checks()
         self.reload_target_list()
-        self.schedule_source_previews(0)
+        self.resume_source_previews_after_layout(80)
 
     def selected_regions(self):
         return [self.region_for(i) for i, var in self.monitor_vars.items() if var.get()]
@@ -2140,7 +2337,7 @@ class App:
             "windows": windows,
             "window_apps": self.selected_apps,
             "targets": [
-                {"name": t["name"], "kind": "template", "path": t["path"], "threshold": threshold, "scales": scales}
+                {"id": target_identity(t), "name": t["name"], "kind": "template", "path": t["path"], "threshold": threshold, "scales": scales}
                 for t in targets
             ],
             "cooldown_seconds": float(self.cooldown.get()),
@@ -2204,7 +2401,7 @@ class App:
                         if window_apps and time.time() - last_window_refresh >= 2:
                             lookup = {item["key"]: item for item in list_app_windows()}
                             windows = [
-                                {"name": f"app-{safe_name(item['display'])}", "title": item["title"], "display": item["display"], "hwnd": item["hwnd"], "key": item["key"]}
+                                {"name": f"app-{safe_name(item['display'])}", "title": item["title"], "display": item["display"], "hwnd": item["hwnd"], "key": item["key"], "minimized": item.get("minimized", False)}
                                 for app in window_apps
                                 for item in [lookup.get(self.app_key(app))]
                                 if item
@@ -2246,6 +2443,7 @@ class App:
                 kept.append(match)
         if not kept:
             return 0
+        self.events.put(("target_hits", [match.get("target_id", match["target"]) for match in kept]))
         alert_dir = ALERTS_DIR if config["alarm"]["save_dir"] == "screenshots" else DATA_DIR / config["alarm"]["save_dir"]
         stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000_000:09d}"
         image_path = alert_dir / f"{stamp}-{region['name']}.png"
@@ -2283,6 +2481,9 @@ class App:
                 kind, message = self.events.get_nowait()
             except queue.Empty:
                 break
+            if kind == "target_hits":
+                self.record_target_hits(message)
+                continue
             self.status.set(message)
             if kind == "stopped":
                 self.worker = None
@@ -2291,6 +2492,24 @@ class App:
             for item in self.log.get_children()[100:]:
                 self.log.delete(item)
         self.root.after(100, self.poll_events)
+
+    def record_target_hits(self, target_ids):
+        counts = {}
+        for item in target_ids:
+            key = str(item)
+            counts[key] = counts.get(key, 0) + 1
+        if not counts:
+            return
+        changed = False
+        for target in self.targets:
+            key = target_identity(target)
+            if key in counts:
+                target["hit_count"] = max(0, int(target.get("hit_count", 0) or 0)) + counts[key]
+                changed = True
+        if changed:
+            self.thumb_cache.clear()
+            self.reload_target_list()
+            self.save_current_profile()
 
     def open_evidence(self):
         path = ALERTS_DIR
@@ -2308,6 +2527,7 @@ def smoke_test():
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--start-minimized", action="store_true")
     args = parser.parse_args(argv)
     if args.smoke_test:
         smoke_test()
@@ -2319,28 +2539,37 @@ def main(argv=None):
         return 0
     root = Tk()
     root.withdraw()
-    try:
-        root.attributes("-alpha", 0.0)
-    except TclError:
-        pass
     app = App(root)
+    saved_geometry = root.geometry()
+    root.geometry(offscreen_geometry(saved_geometry))
     if instance_socket:
         app.start_instance_listener(instance_socket)
     root.update_idletasks()
     app.last_root_size = (max(1, root.winfo_width()), max(1, root.winfo_height()))
     app.apply_scale(force=True)
     root.update_idletasks()
+    if args.start_minimized:
+        app.start_background_tasks()
+        app.ui_ready = True
+        if not app.ensure_tray_icon(show_errors=False):
+            root.geometry(saved_geometry)
+            root.deiconify()
+            root.lift()
+            root.update_idletasks()
+            app.restore_layout()
+            root.update_idletasks()
+        root.mainloop()
+        return 0
     root.deiconify()
-    root.lift()
     root.update_idletasks()
     app.restore_layout()
     root.update_idletasks()
-    try:
-        root.attributes("-alpha", 1.0)
-    except TclError:
-        pass
-    root.after(350, app.restore_layout)
-    root.after(500, app.enable_source_previews)
+    root.geometry(saved_geometry)
+    root.lift()
+    root.update_idletasks()
+    app.ui_ready = True
+    app.start_background_tasks()
+    root.after(1200, app.enable_source_previews)
     app.ensure_tray_icon(show_errors=False)
     root.mainloop()
     return 0

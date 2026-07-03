@@ -246,6 +246,9 @@ class Detector:
         path = Path(value)
         return path if path.is_absolute() else self.base_dir / path
 
+    def _target_id(self, target):
+        return target.get("id", target["name"])
+
     def run(self, frame):
         hits = [None] * len(self.targets)
         gray = None
@@ -284,7 +287,7 @@ class Detector:
         actual = frame[y, x].astype(np.int16)
         dist = int(np.max(np.abs(actual - expected)))
         if dist <= int(target.get("tolerance", 8)):
-            return {"target": target["name"], "kind": "pixel", "score": 1 - dist / 255, "box": [x - 4, y - 4, x + 4, y + 4]}
+            return {"target": target["name"], "target_id": self._target_id(target), "kind": "pixel", "score": 1 - dist / 255, "box": [x - 4, y - 4, x + 4, y + 4]}
         return None
 
     def _template(self, frames, target):
@@ -304,6 +307,7 @@ class Detector:
                 x, y = loc
                 best = {
                     "target": target["name"],
+                    "target_id": self._target_id(target),
                     "kind": "template",
                     "score": score,
                     "scale": item["scale"],
@@ -419,7 +423,7 @@ class Detector:
                     x1, y1 = pts.min(axis=0)
                     x2, y2 = pts.max(axis=0)
                     flat_box = [int(x1), int(y1), int(x2), int(y2)]
-                return {"target": target["name"], "kind": "ocr_text", "score": score, "text": text, "box": flat_box}
+                return {"target": target["name"], "target_id": self._target_id(target), "kind": "ocr_text", "score": score, "text": text, "box": flat_box}
         return None
 
 
