@@ -257,7 +257,7 @@ class CoreTest(unittest.TestCase):
         app.ensure_dwm_sync_loop = mock.Mock()
         appmod.App.sync_dwm_previews_loop(app)
         app.sync_dwm_preview.assert_called_once_with("app:x", app.source_widgets["app:x"]["area"], 222)
-        app.ensure_dwm_sync_loop.assert_called_once()
+        app.ensure_dwm_sync_loop.assert_called_once_with(appmod.DWM_PREVIEW_BUSY_SYNC_MS)
 
     def test_suspend_dwm_preview_unregisters_overlay(self):
         app = object.__new__(appmod.App)
@@ -623,10 +623,34 @@ class CoreTest(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_autohide_scrollbar_only_maps_when_needed(self):
+        root = appmod.Tk()
+        root.geometry("260x180")
+        try:
+            app = object.__new__(appmod.App)
+            canvas = appmod.Canvas(root, width=200, height=120)
+            scrollbar = appmod.ttk.Scrollbar(root, orient="vertical", command=canvas.yview)
+            canvas.pack(side="left", fill="both", expand=True)
+            appmod.App.configure_autohide_scrollbar(app, canvas, scrollbar, side="right", fill="y")
+            canvas.configure(scrollregion=(0, 0, 100, 80))
+            canvas.yview_moveto(0)
+            root.update_idletasks()
+            self.assertFalse(scrollbar.winfo_ismapped())
+            canvas.configure(scrollregion=(0, 0, 100, 400))
+            canvas.yview_moveto(0)
+            root.update_idletasks()
+            self.assertTrue(scrollbar.winfo_ismapped())
+        finally:
+            root.destroy()
+
     def test_resize_ignores_window_moves_without_size_change(self):
         app = object.__new__(appmod.App)
         app.root = mock.Mock()
+        app.root.state.return_value = "normal"
+        app.root.winfo_x.return_value = 30
+        app.root.winfo_y.return_value = 40
         app.last_root_size = (980, 680)
+        app.last_window_geometry = "980x680+0+0"
         app.resize_job = None
         app.move_active_until = 0
         app.schedule_state_save = mock.Mock()
@@ -635,14 +659,20 @@ class CoreTest(unittest.TestCase):
         app.root.after.assert_not_called()
         self.assertTrue(app.move_active_until > 0)
         app.schedule_state_save.assert_called_once_with()
+        self.assertEqual(app.last_window_geometry, "980x680+30+40")
 
     def test_vertical_resize_does_not_reset_horizontal_panes(self):
         app = object.__new__(appmod.App)
         app.root = mock.Mock()
+        app.root.state.return_value = "normal"
+        app.root.winfo_x.return_value = 30
+        app.root.winfo_y.return_value = 40
         app.last_root_size = (980, 680)
+        app.last_window_geometry = "980x680+0+0"
         app.resize_job = None
         event = type("Event", (), {"widget": app.root, "width": 980, "height": 720})()
         appmod.App.on_resize(app, event)
+        self.assertEqual(app.last_window_geometry, "980x720+30+40")
 
         app.left_ratio = 0.5
         app.main_pane = mock.Mock()
@@ -718,6 +748,30 @@ class CoreTest(unittest.TestCase):
         appmod.App.run_scheduled_state_save(app)
         self.assertIsNone(app.state_save_job)
         app.save_state.assert_called_once()
+
+    def test_save_state_uses_last_visible_geometry_when_hidden(self):
+        old_state = appmod.STATE_PATH
+        with tempfile.TemporaryDirectory() as tmp:
+            appmod.STATE_PATH = Path(tmp) / "state.json"
+            try:
+                app = object.__new__(appmod.App)
+                app.root = mock.Mock()
+                app.root.state.return_value = "withdrawn"
+                app.root.geometry.return_value = "1x1+-32000+-32000"
+                app.last_window_geometry = "1400x900+120+80"
+                app.layout = {"geometry": "980x680+0+0"}
+                app.current_profile = 1
+                app.main_ratio = 0.7
+                app.right_ratio = 0.2
+                app.left_ratio = 0.5
+                app.max_alerts = mock.Mock()
+                app.max_alerts.get.return_value = 10
+                app.capture_layout_ratios = mock.Mock()
+                appmod.App.save_state(app)
+                data = appmod.load_json(appmod.STATE_PATH, {})
+                self.assertEqual(data["layout"]["geometry"], "1400x900+120+80")
+            finally:
+                appmod.STATE_PATH = old_state
 
     def test_apply_scale_does_not_reset_panes_on_outer_resize(self):
         app = object.__new__(appmod.App)

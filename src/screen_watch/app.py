@@ -70,6 +70,7 @@ PREVIEW_H = 200
 SCREEN_PREVIEW_SECONDS = 0.25
 SOURCE_PREVIEW_SYNC_MS = 250
 DWM_PREVIEW_SYNC_MS = 33
+DWM_PREVIEW_BUSY_SYNC_MS = 100
 TARGET_RESCALE_BATCH = 1
 MIN_SCAN_INTERVAL_MS = 120
 VK_LBUTTON = 0x01
@@ -967,6 +968,7 @@ class App:
         self.resize_shell = None
         self.resize_shell_active = False
         self.last_root_size = None
+        self.last_window_geometry = self.layout.get("geometry", "980x680")
         self.resize_active_until = 0
         self.move_active_until = 0
         self.layout_active_until = 0
@@ -1054,8 +1056,7 @@ class App:
         preview_outer = ttk.Frame(self.main_pane, width=380)
         self.right_canvas = Canvas(right_outer, highlightthickness=0)
         right_scroll = ttk.Scrollbar(right_outer, orient="vertical", command=self.right_canvas.yview)
-        self.right_canvas.configure(yscrollcommand=right_scroll.set)
-        right_scroll.pack(side="right", fill="y")
+        self.configure_autohide_scrollbar(self.right_canvas, right_scroll, side="right", fill="y")
         self.right_canvas.pack(side="left", fill="both", expand=True)
         right = ttk.Frame(self.right_canvas)
         right_window = self.right_canvas.create_window((0, 0), window=right, anchor="nw")
@@ -1074,9 +1075,8 @@ class App:
         preview_box.pack(fill="both", expand=True)
         self.source_canvas = Canvas(preview_box, highlightthickness=0)
         source_scroll = ttk.Scrollbar(preview_box, orient="vertical", command=self.source_canvas.yview)
-        self.source_canvas.configure(yscrollcommand=source_scroll.set)
+        self.configure_autohide_scrollbar(self.source_canvas, source_scroll, side="right", fill="y")
         self.source_canvas.pack(side="left", fill="both", expand=True)
-        source_scroll.pack(side="right", fill="y")
         self.source_frame = ttk.Frame(self.source_canvas)
         self.source_window = self.source_canvas.create_window((0, 0), window=self.source_frame, anchor="nw")
         self.source_frame.bind("<Configure>", lambda _event: self.source_canvas.configure(scrollregion=self.source_canvas.bbox("all")))
@@ -1115,8 +1115,7 @@ class App:
         self.target_canvas = Canvas(gallery_box, highlightthickness=0, height=260)
         self.target_canvas.pack(side="left", fill="both", expand=True)
         scroll = ttk.Scrollbar(gallery_box, orient="vertical", command=self.target_canvas.yview)
-        scroll.pack(side="right", fill="y")
-        self.target_canvas.configure(yscrollcommand=scroll.set)
+        self.configure_autohide_scrollbar(self.target_canvas, scroll, side="right", fill="y")
         self.target_canvas.bind("<Button-1>", lambda _event: self.target_canvas.focus_set())
         self.target_canvas.bind("<MouseWheel>", self.scroll_targets)
         self.gallery_inner = ttk.Frame(self.target_canvas)
@@ -1277,6 +1276,19 @@ class App:
     def scroll_right(self, event):
         self.right_canvas.yview_scroll(int(-event.delta / 120), "units")
         return "break"
+
+    def configure_autohide_scrollbar(self, canvas, scrollbar, **pack_options):
+        def set_scroll(first, last):
+            first = float(first)
+            last = float(last)
+            if first <= 0.0 and last >= 1.0:
+                if scrollbar.winfo_ismapped():
+                    scrollbar.pack_forget()
+            elif not scrollbar.winfo_ismapped():
+                scrollbar.pack(**pack_options)
+            scrollbar.set(first, last)
+
+        canvas.configure(yscrollcommand=set_scroll)
 
     def begin_layout_drag(self, _event=None):
         self.layout_active_until = time.time() + 0.8
@@ -1849,10 +1861,10 @@ class App:
         except Exception:
             return False
 
-    def ensure_dwm_sync_loop(self):
+    def ensure_dwm_sync_loop(self, delay=DWM_PREVIEW_SYNC_MS):
         if getattr(self, "dwm_sync_job", None) is None and getattr(self, "dwm_thumbs", None):
             try:
-                self.dwm_sync_job = self.root.after(DWM_PREVIEW_SYNC_MS, self.sync_dwm_previews_loop)
+                self.dwm_sync_job = self.root.after(delay, self.sync_dwm_previews_loop)
             except TclError:
                 self.dwm_sync_job = None
 
@@ -1864,7 +1876,7 @@ class App:
                 if widgets:
                     self.sync_dwm_preview(key, widgets["area"], record["hwnd"])
             if self.layout_busy() and self.dwm_thumbs:
-                self.ensure_dwm_sync_loop()
+                self.ensure_dwm_sync_loop(DWM_PREVIEW_BUSY_SYNC_MS)
         except Exception:
             pass
 
@@ -2071,14 +2083,35 @@ class App:
         self.state_save_job = None
         self.save_state()
 
+    def current_visible_geometry(self):
+        try:
+            if self.root.state() != "withdrawn":
+                geometry = self.root.geometry()
+                if re.match(r"^\d+x\d+[+-]\d+[+-]\d+$", geometry):
+                    self.last_window_geometry = geometry
+        except Exception:
+            pass
+        return getattr(self, "last_window_geometry", self.layout.get("geometry", "980x680"))
+
+    def remember_window_geometry(self, width=None, height=None):
+        try:
+            if self.root.state() == "withdrawn":
+                return
+            width = max(1, int(width or self.root.winfo_width()))
+            height = max(1, int(height or self.root.winfo_height()))
+            self.last_window_geometry = f"{width}x{height}+{self.root.winfo_x()}+{self.root.winfo_y()}"
+        except Exception:
+            pass
+
     def save_state(self):
         self.capture_layout_ratios()
+        geometry = self.current_visible_geometry()
         write_json(
             STATE_PATH,
             {
                 "last_profile": self.current_profile,
                 "layout": {
-                    "geometry": self.root.geometry(),
+                    "geometry": geometry,
                     "main_ratio": self.main_ratio,
                     "right_ratio": self.right_ratio,
                     "left_ratio": self.left_ratio,
@@ -2352,6 +2385,7 @@ class App:
         if event.widget != self.root:
             return
         size = (event.width, event.height)
+        self.remember_window_geometry(event.width, event.height)
         if size == self.last_root_size:
             self.move_active_until = time.time() + 0.3
             self.schedule_state_save()
