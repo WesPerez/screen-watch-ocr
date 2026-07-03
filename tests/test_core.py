@@ -748,6 +748,51 @@ class CoreTest(unittest.TestCase):
         app.root.after.assert_not_called()
         app.reload_target_list.assert_called_once()
 
+    def test_apply_scale_reuses_existing_gallery_cards(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.root.winfo_width.return_value = 1300
+        app.root.winfo_height.return_value = 820
+        app.root.after.return_value = "rescale-job"
+        app.last_root_size = (1300, 820)
+        app.resize_job = object()
+        app.last_scale = 1.0
+        app.fonts = {"TkDefaultFont": mock.Mock()}
+        app.base_font_sizes = {"TkDefaultFont": 10}
+        app.style = mock.Mock()
+        app.redraw_checks = mock.Mock()
+        app.reload_target_list = mock.Mock()
+        app.resume_source_previews_after_layout = mock.Mock()
+        app.mouse_button_down = mock.Mock(return_value=False)
+        app.target_name_font = mock.Mock()
+        app.targets = [{"path": "one.png", "enabled": True}]
+        app.selected_target = 0
+        app.thumb_refs = ["old"]
+        app.target_rescale_job = None
+        app.target_rescale_index = 0
+        app.target_rescale_refs = []
+        app.target_canvas = mock.Mock()
+        app.update_target_select_button = mock.Mock()
+        app.status = mock.Mock()
+        app.make_thumb = mock.Mock(return_value="thumb")
+        app.one_line_name = mock.Mock(return_value="one.png")
+        card, image, text = mock.Mock(), mock.Mock(), mock.Mock()
+        app.target_cards = {0: (card, image, text)}
+        appmod.App.apply_scale(app)
+        app.reload_target_list.assert_not_called()
+        app.make_thumb.assert_not_called()
+        app.root.after.assert_called_with(80, app.rescale_target_list_batch)
+        self.assertEqual(app.target_rescale_job, "rescale-job")
+        appmod.App.rescale_target_list_batch(app)
+        app.reload_target_list.assert_not_called()
+        app.make_thumb.assert_called_once_with(app.targets[0])
+        self.assertEqual(app.thumb_refs, ["thumb"])
+        card.configure.assert_called_once()
+        image.configure.assert_called_once()
+        image.place.assert_called_once()
+        text.configure.assert_called_once()
+        text.place.assert_called_once()
+
     def test_main_restores_layout_after_window_is_shown(self):
         root = mock.Mock()
         root.winfo_width.return_value = 980

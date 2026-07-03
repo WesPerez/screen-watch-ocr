@@ -70,6 +70,7 @@ PREVIEW_H = 200
 SCREEN_PREVIEW_SECONDS = 0.25
 SOURCE_PREVIEW_SYNC_MS = 250
 DWM_PREVIEW_SYNC_MS = 33
+TARGET_RESCALE_BATCH = 1
 MIN_SCAN_INTERVAL_MS = 120
 VK_LBUTTON = 0x01
 INSTANCE_HOST = "127.0.0.1"
@@ -952,6 +953,9 @@ class App:
         self.thumb_refs = []
         self.target_vars = []
         self.target_cards = {}
+        self.target_rescale_job = None
+        self.target_rescale_index = 0
+        self.target_rescale_refs = []
         self.target_last_click = (None, 0)
         self.thumb_cache = {}
         self.selected_target = None
@@ -1939,6 +1943,7 @@ class App:
         return text + marker
 
     def reload_target_list(self):
+        self.cancel_target_rescale()
         for child in self.gallery_inner.winfo_children():
             child.destroy()
         self.thumb_refs.clear()
@@ -1978,6 +1983,81 @@ class App:
         self.target_canvas.configure(height=max(150, int((self.thumb_h + 34) * 2)))
         self.update_target_select_button()
         self.status.set(f"当前 {len(self.targets)} 张模板，启用 {len(self.enabled_targets())} 张。")
+
+    def cancel_target_rescale(self):
+        job = getattr(self, "target_rescale_job", None)
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except TclError:
+                pass
+        self.target_rescale_job = None
+        self.target_rescale_index = 0
+        self.target_rescale_refs = []
+
+    def finish_target_rescale(self):
+        self.target_canvas.configure(height=max(150, int((self.thumb_h + 34) * 2)))
+        self.update_target_select_button()
+        self.status.set(f"当前 {len(self.targets)} 张模板，启用 {len(self.enabled_targets())} 张。")
+
+    def rescale_target_card(self, idx, target, refs):
+        widgets = self.target_cards.get(idx)
+        if not widgets or len(widgets) < 3:
+            return False
+        card, image, text = widgets[:3]
+        bg = "#dbeafe" if idx == self.selected_target else "#ffffff"
+        text_font = getattr(self, "target_name_font", self.fonts.get("TkDefaultFont"))
+        thumb = self.make_thumb(target)
+        refs.append(thumb)
+        card.configure(bg=bg, width=self.thumb_w + 12, height=self.thumb_h + max(24, int(22 * self.last_scale)))
+        image.configure(image=thumb, bg=bg, width=self.thumb_w, height=self.thumb_h)
+        image.place(x=6, y=6, width=self.thumb_w, height=self.thumb_h)
+        text.configure(text=self.one_line_name(Path(target["path"]).name, self.thumb_w), bg=bg, font=text_font)
+        text.place(x=4, y=self.thumb_h + 8, width=self.thumb_w + 4, height=max(16, int(16 * self.last_scale)))
+        return True
+
+    def rescale_target_list(self, cancel_pending=True):
+        if cancel_pending:
+            self.cancel_target_rescale()
+        if len(getattr(self, "target_cards", {})) != len(self.targets):
+            self.reload_target_list()
+            return
+        new_refs = []
+        for idx, target in enumerate(self.targets):
+            if not self.rescale_target_card(idx, target, new_refs):
+                self.reload_target_list()
+                return
+        self.thumb_refs = new_refs
+        self.finish_target_rescale()
+
+    def schedule_target_rescale(self, delay=80):
+        if len(getattr(self, "target_cards", {})) != len(self.targets):
+            self.reload_target_list()
+            return
+        self.cancel_target_rescale()
+        self.target_rescale_job = self.root.after(delay, self.rescale_target_list_batch)
+
+    def rescale_target_list_batch(self):
+        self.target_rescale_job = None
+        if len(getattr(self, "target_cards", {})) != len(self.targets):
+            self.reload_target_list()
+            return
+        refs = getattr(self, "target_rescale_refs", [])
+        start = getattr(self, "target_rescale_index", 0)
+        end = min(len(self.targets), start + TARGET_RESCALE_BATCH)
+        for idx in range(start, end):
+            if not self.rescale_target_card(idx, self.targets[idx], refs):
+                self.reload_target_list()
+                return
+        self.target_rescale_refs = refs
+        self.target_rescale_index = end
+        if end < len(self.targets):
+            self.target_rescale_job = self.root.after(16, self.rescale_target_list_batch)
+            return
+        self.thumb_refs = refs
+        self.target_rescale_refs = []
+        self.target_rescale_index = 0
+        self.finish_target_rescale()
 
     def enabled_targets(self):
         return [t for t in self.targets if t.get("enabled", True)]
@@ -2296,7 +2376,13 @@ class App:
         self.thumb_w = int(104 * scale)
         self.thumb_h = int(72 * scale)
         self.redraw_checks()
-        self.reload_target_list()
+        if hasattr(self, "target_cards") and hasattr(self, "target_canvas"):
+            if force:
+                self.rescale_target_list()
+            else:
+                self.schedule_target_rescale()
+        else:
+            self.reload_target_list()
         self.resume_source_previews_after_layout(80)
 
     def selected_regions(self):
