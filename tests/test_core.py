@@ -928,7 +928,6 @@ class CoreTest(unittest.TestCase):
         app.cancel_target_rescale = mock.Mock()
         appmod.App.begin_outer_resize(app)
         self.assertTrue(app.resize_shell_active)
-        self.assertFalse(app.outer_resize_changed)
         app.pause_source_previews_for_layout.assert_called_once()
         app.cancel_target_rescale.assert_called_once()
         app.main_pane.pack_forget.assert_not_called()
@@ -944,11 +943,9 @@ class CoreTest(unittest.TestCase):
         app.root.winfo_width.return_value = 1000
         app.root.winfo_height.return_value = 700
         app.last_root_size = (1000, 700)
-        app.last_resize_at = 0
         app.mouse_button_down = mock.Mock(return_value=False)
         app.apply_scale = mock.Mock()
         app.restore_layout = mock.Mock()
-        app.freeze_window_redraw = mock.Mock()
         app.schedule_state_save = mock.Mock()
         app.resume_source_previews_after_layout = mock.Mock()
         appmod.App.finish_outer_resize(app)
@@ -957,7 +954,6 @@ class CoreTest(unittest.TestCase):
         app.root.update_idletasks.assert_not_called()
         app.apply_scale.assert_called_once_with()
         app.restore_layout.assert_called_once()
-        app.freeze_window_redraw.assert_called_once_with(False)
         app.schedule_state_save.assert_called_once_with(0)
         app.resume_source_previews_after_layout.assert_called_once_with(160)
 
@@ -969,7 +965,6 @@ class CoreTest(unittest.TestCase):
         app.root.winfo_width.return_value = 1000
         app.root.winfo_height.return_value = 680
         app.last_root_size = (1000, 680)
-        app.last_resize_at = 0
         app.last_scale = 1.0
         app.fonts = {}
         app.base_font_sizes = {}
@@ -978,77 +973,12 @@ class CoreTest(unittest.TestCase):
         app.reload_target_list = mock.Mock()
         app.restore_layout = mock.Mock()
         app.resume_source_previews_after_layout = mock.Mock()
-        app.freeze_window_redraw = mock.Mock()
         app.schedule_state_save = mock.Mock()
         app.mouse_button_down = mock.Mock(return_value=False)
         appmod.App.finish_outer_resize(app)
         app.reload_target_list.assert_not_called()
         app.redraw_checks.assert_not_called()
         app.restore_layout.assert_called_once()
-
-    def test_finish_outer_resize_waits_for_quiet_configure_period(self):
-        app = object.__new__(appmod.App)
-        app.resize_job = None
-        app.resize_shell_active = True
-        app.root = mock.Mock()
-        app.root.winfo_width.return_value = 1000
-        app.root.winfo_height.return_value = 700
-        app.root.after.return_value = "again"
-        app.last_root_size = (1000, 700)
-        app.last_resize_at = appmod.time.time()
-        app.mouse_button_down = mock.Mock(return_value=False)
-        app.apply_scale = mock.Mock()
-        app.restore_layout = mock.Mock()
-        app.freeze_window_redraw = mock.Mock()
-        app.schedule_state_save = mock.Mock()
-        appmod.App.finish_outer_resize(app)
-        app.root.after.assert_called_once_with(120, app.finish_outer_resize)
-        self.assertEqual(app.resize_job, "again")
-        app.apply_scale.assert_not_called()
-        app.restore_layout.assert_not_called()
-
-    def test_finish_outer_resize_waits_for_native_exit(self):
-        app = object.__new__(appmod.App)
-        app.resize_job = None
-        app.resize_shell_active = True
-        app.native_resize_active = True
-        app.root = mock.Mock()
-        app.root.winfo_width.return_value = 1000
-        app.root.winfo_height.return_value = 700
-        app.root.after.return_value = "again"
-        app.last_root_size = (1000, 700)
-        app.last_resize_at = 0
-        app.mouse_button_down = mock.Mock(return_value=False)
-        app.apply_scale = mock.Mock()
-        app.restore_layout = mock.Mock()
-        appmod.App.finish_outer_resize(app)
-        app.root.after.assert_called_once_with(120, app.finish_outer_resize)
-        self.assertEqual(app.resize_job, "again")
-        app.apply_scale.assert_not_called()
-        app.restore_layout.assert_not_called()
-
-    def test_finish_outer_resize_skips_layout_for_move_only(self):
-        app = object.__new__(appmod.App)
-        app.resize_job = None
-        app.resize_shell_active = True
-        app.native_resize_active = False
-        app.outer_resize_changed = False
-        app.root = mock.Mock()
-        app.root.winfo_width.return_value = 1000
-        app.root.winfo_height.return_value = 700
-        app.last_root_size = (1000, 700)
-        app.last_resize_at = 0
-        app.mouse_button_down = mock.Mock(return_value=False)
-        app.apply_scale = mock.Mock()
-        app.restore_layout = mock.Mock()
-        app.freeze_window_redraw = mock.Mock()
-        app.schedule_state_save = mock.Mock()
-        app.resume_source_previews_after_layout = mock.Mock()
-        appmod.App.finish_outer_resize(app)
-        app.apply_scale.assert_not_called()
-        app.restore_layout.assert_not_called()
-        app.freeze_window_redraw.assert_called_once_with(False)
-        app.schedule_state_save.assert_called_once_with(0)
 
     def test_finish_outer_resize_waits_until_mouse_released(self):
         app = object.__new__(appmod.App)
@@ -1058,7 +988,6 @@ class CoreTest(unittest.TestCase):
         app.root.winfo_height.return_value = 700
         app.root.after.return_value = "again"
         app.last_root_size = (1000, 700)
-        app.last_resize_at = 0
         app.mouse_button_down = mock.Mock(return_value=True)
         app.apply_scale = mock.Mock()
         app.restore_layout = mock.Mock()
@@ -1068,19 +997,18 @@ class CoreTest(unittest.TestCase):
         app.apply_scale.assert_not_called()
         app.restore_layout.assert_not_called()
 
-    def test_dwm_sync_pauses_during_outer_resize(self):
+    def test_dwm_sync_keeps_thumbnail_updated_during_outer_resize(self):
         app = object.__new__(appmod.App)
         app.dwm_sync_job = None
         app.resize_shell_active = True
-        app.native_resize_active = False
         app.dwm_thumbs = {"one": {"hwnd": 1}}
         app.source_widgets = {"one": {"area": mock.Mock()}}
         app.sync_dwm_preview = mock.Mock()
         app.layout_busy = mock.Mock(return_value=True)
         app.ensure_dwm_sync_loop = mock.Mock()
         appmod.App.sync_dwm_previews_loop(app)
-        app.sync_dwm_preview.assert_not_called()
-        app.ensure_dwm_sync_loop.assert_not_called()
+        app.sync_dwm_preview.assert_called_once_with("one", app.source_widgets["one"]["area"], 1)
+        app.ensure_dwm_sync_loop.assert_called_once()
 
     def test_horizontal_resize_stretches_left_pane_only(self):
         root = appmod.Tk()
