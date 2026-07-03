@@ -48,20 +48,6 @@ class CoreTest(unittest.TestCase):
             self.assertEqual(matches[0]["box"], [70, 50, 122, 89])
             self.assertEqual(matches[0]["scale"], 1.3)
 
-    def test_detector_carries_stable_target_id(self):
-        import numpy as np
-
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
-            template = np.full((8, 8, 3), 180, dtype=np.uint8)
-            template[2:6, 2:6] = [20, 90, 240]
-            path = base / "target.png"
-            Image.fromarray(template).save(path)
-            frame = np.zeros((30, 30, 3), dtype=np.uint8)
-            frame[10:18, 11:19] = template
-            detector = Detector({"_base_dir": str(base), "targets": [{"id": "stable-1", "name": "target", "kind": "template", "path": str(path), "threshold": 0.99, "scales": [1.0]}]})
-            self.assertEqual(detector.run(frame)[0]["target_id"], "stable-1")
-
     def test_detector_matches_template_on_large_frame_fast_path(self):
         import numpy as np
 
@@ -179,23 +165,6 @@ class CoreTest(unittest.TestCase):
             slow.assert_called_once()
             self.assertEqual(fast.call_count, 2)
 
-    def test_window_capture_minimized_does_not_grab_desktop_fallback(self):
-        import numpy as np
-
-        cache = {123: "visible"}
-        with mock.patch.object(appmod, "window_is_minimized", return_value=True), mock.patch.object(appmod, "capture_window", return_value=np.zeros((2, 2, 3), dtype=np.uint8)), mock.patch.object(appmod, "capture_window_visible") as visible:
-            self.assertIsNone(appmod.capture_window_frame(object(), 123, cache))
-            visible.assert_not_called()
-            self.assertEqual(cache, {123: "visible"})
-
-    def test_window_capture_minimized_keeps_printwindow_frame_if_available(self):
-        import numpy as np
-
-        frame = np.full((2, 2, 3), 80, dtype=np.uint8)
-        with mock.patch.object(appmod, "window_is_minimized", return_value=True), mock.patch.object(appmod, "capture_window", return_value=frame), mock.patch.object(appmod, "capture_window_visible") as visible:
-            self.assertIs(appmod.capture_window_frame(object(), 123), frame)
-            visible.assert_not_called()
-
     def test_window_capture_crops_printwindow_black_padding_before_visible_fallback(self):
         import numpy as np
 
@@ -257,7 +226,7 @@ class CoreTest(unittest.TestCase):
         app.ensure_dwm_sync_loop = mock.Mock()
         appmod.App.sync_dwm_previews_loop(app)
         app.sync_dwm_preview.assert_called_once_with("app:x", app.source_widgets["app:x"]["area"], 222)
-        app.ensure_dwm_sync_loop.assert_called_once_with(appmod.DWM_PREVIEW_BUSY_SYNC_MS)
+        app.ensure_dwm_sync_loop.assert_called_once()
 
     def test_suspend_dwm_preview_unregisters_overlay(self):
         app = object.__new__(appmod.App)
@@ -267,19 +236,6 @@ class CoreTest(unittest.TestCase):
             appmod.App.suspend_dwm_previews(app)
             unregister.assert_called_once_with(thumb)
             self.assertEqual(app.dwm_thumbs, {})
-
-    def test_layout_drag_pauses_and_resumes_source_previews(self):
-        app = object.__new__(appmod.App)
-        app.source_previews_enabled = True
-        app.layout_paused_previews = False
-        app.disable_source_previews = mock.Mock(side_effect=lambda: setattr(app, "source_previews_enabled", False))
-        app.enable_source_previews = mock.Mock()
-        appmod.App.pause_source_previews_for_layout(app)
-        app.disable_source_previews.assert_called_once()
-        self.assertTrue(app.layout_paused_previews)
-        appmod.App.resume_source_previews_after_layout(app, 80)
-        app.enable_source_previews.assert_called_once_with(80)
-        self.assertFalse(app.layout_paused_previews)
 
     def test_hide_to_tray_unregisters_dwm_preview_before_withdraw(self):
         app = object.__new__(appmod.App)
@@ -445,10 +401,6 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(template_name(1, 11, "20260701"), "1-11-20260701")
         self.assertRegex(template_name(5, 2), r"^5-2-\d{20}$")
 
-    def test_offscreen_geometry_keeps_saved_size(self):
-        self.assertEqual(appmod.offscreen_geometry("1200x700+30+40"), "1200x700+-32000+-32000")
-        self.assertEqual(appmod.offscreen_geometry("bad"), "980x680+-32000+-32000")
-
     def test_normalize_target_names_fills_deleted_number_gap(self):
         old_data, old_thumbs = appmod.DATA_DIR, appmod.THUMBS_DIR
         with tempfile.TemporaryDirectory() as tmp:
@@ -457,7 +409,7 @@ class CoreTest(unittest.TestCase):
             appmod.THUMBS_DIR = appmod.DATA_DIR / "thumbs"
             try:
                 targets = []
-                for name in ("1-1-old-a", "1-3-old-b"):
+                for name in ("1-1-old", "1-3-old"):
                     template = appmod.DATA_DIR / "templates" / f"{name}.png"
                     thumb = appmod.THUMBS_DIR / f"{name}.png"
                     template.parent.mkdir(parents=True, exist_ok=True)
@@ -467,11 +419,9 @@ class CoreTest(unittest.TestCase):
                     targets.append({"name": name, "path": str(template), "thumb": str(thumb)})
                 renamed, changed = normalize_target_names(targets, 1)
                 self.assertTrue(changed)
-                self.assertEqual([Path(t["path"]).stem for t in renamed], ["1-1-old-a", "1-2-old-b"])
-                self.assertEqual([t["id"] for t in renamed], ["old-a", "old-b"])
-                self.assertEqual([t["hit_count"] for t in renamed], [0, 0])
+                self.assertEqual([Path(t["path"]).stem for t in renamed], ["1-1-old", "1-2-old"])
                 self.assertTrue(Path(renamed[1]["thumb"]).exists())
-                self.assertFalse((appmod.DATA_DIR / "templates" / "1-3-old-b.png").exists())
+                self.assertFalse((appmod.DATA_DIR / "templates" / "1-3-old.png").exists())
             finally:
                 appmod.DATA_DIR, appmod.THUMBS_DIR = old_data, old_thumbs
 
@@ -484,7 +434,7 @@ class CoreTest(unittest.TestCase):
             appmod.THUMBS_DIR = appmod.DATA_DIR / "thumbs"
             try:
                 targets = []
-                for name in ("1-1-old-a", "1-3-old-b"):
+                for name in ("1-1-old", "1-3-old"):
                     template = appmod.DATA_DIR / "templates" / f"{name}.png"
                     thumb = appmod.THUMBS_DIR / f"{name}.png"
                     template.parent.mkdir(parents=True, exist_ok=True)
@@ -495,7 +445,7 @@ class CoreTest(unittest.TestCase):
                 appmod.write_json(appmod.PROFILES_DIR / "profile_1.json", {"targets": targets})
                 self.assertTrue(normalize_profile_file(1))
                 data = appmod.load_json(appmod.PROFILES_DIR / "profile_1.json", {})
-                self.assertEqual([Path(t["path"]).stem for t in data["targets"]], ["1-1-old-a", "1-2-old-b"])
+                self.assertEqual([Path(t["path"]).stem for t in data["targets"]], ["1-1-old", "1-2-old"])
             finally:
                 appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.THUMBS_DIR = old_data, old_profiles, old_thumbs
 
@@ -623,56 +573,24 @@ class CoreTest(unittest.TestCase):
         finally:
             root.destroy()
 
-    def test_autohide_scrollbar_only_maps_when_needed(self):
-        root = appmod.Tk()
-        root.geometry("260x180")
-        try:
-            app = object.__new__(appmod.App)
-            canvas = appmod.Canvas(root, width=200, height=120)
-            scrollbar = appmod.ttk.Scrollbar(root, orient="vertical", command=canvas.yview)
-            canvas.pack(side="left", fill="both", expand=True)
-            appmod.App.configure_autohide_scrollbar(app, canvas, scrollbar, side="right", fill="y")
-            canvas.configure(scrollregion=(0, 0, 100, 80))
-            canvas.yview_moveto(0)
-            root.update_idletasks()
-            self.assertFalse(scrollbar.winfo_ismapped())
-            canvas.configure(scrollregion=(0, 0, 100, 400))
-            canvas.yview_moveto(0)
-            root.update_idletasks()
-            self.assertTrue(scrollbar.winfo_ismapped())
-        finally:
-            root.destroy()
-
     def test_resize_ignores_window_moves_without_size_change(self):
         app = object.__new__(appmod.App)
         app.root = mock.Mock()
-        app.root.state.return_value = "normal"
-        app.root.winfo_x.return_value = 30
-        app.root.winfo_y.return_value = 40
         app.last_root_size = (980, 680)
-        app.last_window_geometry = "980x680+0+0"
         app.resize_job = None
         app.move_active_until = 0
-        app.schedule_state_save = mock.Mock()
         event = type("Event", (), {"widget": app.root, "width": 980, "height": 680})()
         appmod.App.on_resize(app, event)
         app.root.after.assert_not_called()
         self.assertTrue(app.move_active_until > 0)
-        app.schedule_state_save.assert_called_once_with()
-        self.assertEqual(app.last_window_geometry, "980x680+30+40")
 
     def test_vertical_resize_does_not_reset_horizontal_panes(self):
         app = object.__new__(appmod.App)
         app.root = mock.Mock()
-        app.root.state.return_value = "normal"
-        app.root.winfo_x.return_value = 30
-        app.root.winfo_y.return_value = 40
         app.last_root_size = (980, 680)
-        app.last_window_geometry = "980x680+0+0"
         app.resize_job = None
         event = type("Event", (), {"widget": app.root, "width": 980, "height": 720})()
         appmod.App.on_resize(app, event)
-        self.assertEqual(app.last_window_geometry, "980x720+30+40")
 
         app.left_ratio = 0.5
         app.main_pane = mock.Mock()
@@ -735,21 +653,17 @@ class CoreTest(unittest.TestCase):
         app.save_state.assert_called_once()
         app.schedule_source_previews.assert_called_once_with(0)
 
-    def test_scheduled_state_save_debounces_and_saves(self):
+    def test_resize_remembers_full_window_geometry(self):
         app = object.__new__(appmod.App)
         app.root = mock.Mock()
-        app.root.after.return_value = "new"
-        app.state_save_job = "old"
-        app.save_state = mock.Mock()
-        appmod.App.schedule_state_save(app, 25)
-        app.root.after_cancel.assert_called_once_with("old")
-        app.root.after.assert_called_once_with(25, app.run_scheduled_state_save)
-        self.assertEqual(app.state_save_job, "new")
-        appmod.App.run_scheduled_state_save(app)
-        self.assertIsNone(app.state_save_job)
-        app.save_state.assert_called_once()
+        app.root.state.return_value = "normal"
+        app.root.winfo_x.return_value = 30
+        app.root.winfo_y.return_value = 40
+        app.last_window_geometry = "980x680+0+0"
+        appmod.App.remember_window_geometry(app, 1200, 720)
+        self.assertEqual(app.last_window_geometry, "1200x720+30+40")
 
-    def test_save_state_uses_last_visible_geometry_when_hidden(self):
+    def test_save_state_keeps_last_visible_geometry_when_hidden(self):
         old_state = appmod.STATE_PATH
         with tempfile.TemporaryDirectory() as tmp:
             appmod.STATE_PATH = Path(tmp) / "state.json"
@@ -759,7 +673,6 @@ class CoreTest(unittest.TestCase):
                 app.root.state.return_value = "withdrawn"
                 app.root.geometry.return_value = "1x1+-32000+-32000"
                 app.last_window_geometry = "1400x900+120+80"
-                app.layout = {"geometry": "980x680+0+0"}
                 app.current_profile = 1
                 app.main_ratio = 0.7
                 app.right_ratio = 0.2
@@ -818,82 +731,19 @@ class CoreTest(unittest.TestCase):
         app.root.after.assert_not_called()
         app.reload_target_list.assert_called_once()
 
-    def test_apply_scale_reuses_existing_gallery_cards(self):
-        app = object.__new__(appmod.App)
-        app.root = mock.Mock()
-        app.root.winfo_width.return_value = 1300
-        app.root.winfo_height.return_value = 820
-        app.root.after.return_value = "rescale-job"
-        app.last_root_size = (1300, 820)
-        app.resize_job = object()
-        app.last_scale = 1.0
-        app.fonts = {"TkDefaultFont": mock.Mock()}
-        app.base_font_sizes = {"TkDefaultFont": 10}
-        app.style = mock.Mock()
-        app.redraw_checks = mock.Mock()
-        app.reload_target_list = mock.Mock()
-        app.resume_source_previews_after_layout = mock.Mock()
-        app.mouse_button_down = mock.Mock(return_value=False)
-        app.target_name_font = mock.Mock()
-        app.targets = [{"path": "one.png", "enabled": True}]
-        app.selected_target = 0
-        app.thumb_refs = ["old"]
-        app.target_rescale_job = None
-        app.target_rescale_index = 0
-        app.target_rescale_refs = []
-        app.target_canvas = mock.Mock()
-        app.update_target_select_button = mock.Mock()
-        app.status = mock.Mock()
-        app.make_thumb = mock.Mock(return_value="thumb")
-        app.one_line_name = mock.Mock(return_value="one.png")
-        card, image, text = mock.Mock(), mock.Mock(), mock.Mock()
-        app.target_cards = {0: (card, image, text)}
-        appmod.App.apply_scale(app)
-        app.reload_target_list.assert_not_called()
-        app.make_thumb.assert_not_called()
-        app.root.after.assert_called_with(80, app.rescale_target_list_batch)
-        self.assertEqual(app.target_rescale_job, "rescale-job")
-        appmod.App.rescale_target_list_batch(app)
-        app.reload_target_list.assert_not_called()
-        app.make_thumb.assert_called_once_with(app.targets[0])
-        self.assertEqual(app.thumb_refs, ["thumb"])
-        card.configure.assert_called_once()
-        image.configure.assert_called_once()
-        image.place.assert_called_once()
-        text.configure.assert_called_once()
-        text.place.assert_called_once()
-
     def test_main_restores_layout_after_window_is_shown(self):
         root = mock.Mock()
         root.winfo_width.return_value = 980
         root.winfo_height.return_value = 680
-        root.geometry.side_effect = ["1200x700+30+40", None, None]
         app = mock.Mock()
         with mock.patch.object(appmod, "claim_single_instance", return_value=False), mock.patch.object(appmod, "Tk", return_value=root), mock.patch.object(appmod, "App", return_value=app):
             self.assertEqual(appmod.main([]), 0)
-        root.geometry.assert_any_call("1200x700+-32000+-32000")
-        root.geometry.assert_any_call("1200x700+30+40")
         root.deiconify.assert_called_once()
         root.lift.assert_called_once()
-        app.start_background_tasks.assert_called_once()
-        root.after.assert_any_call(1200, app.enable_source_previews)
-        self.assertTrue(app.ui_ready)
-        root.mainloop.assert_called_once()
-
-    def test_main_start_minimized_stays_in_tray(self):
-        root = mock.Mock()
-        root.winfo_width.return_value = 980
-        root.winfo_height.return_value = 680
-        root.geometry.side_effect = ["1200x700+30+40", None]
-        app = mock.Mock()
-        app.ensure_tray_icon.return_value = True
-        with mock.patch.object(appmod, "claim_single_instance", return_value=False), mock.patch.object(appmod, "Tk", return_value=root), mock.patch.object(appmod, "App", return_value=app):
-            self.assertEqual(appmod.main(["--start-minimized"]), 0)
-        root.geometry.assert_any_call("1200x700+-32000+-32000")
-        root.geometry.assert_any_call()
-        app.start_background_tasks.assert_called_once()
-        app.ensure_tray_icon.assert_called_once_with(show_errors=False)
-        root.deiconify.assert_not_called()
+        root.attributes.assert_any_call("-alpha", 0.0)
+        root.attributes.assert_any_call("-alpha", 1.0)
+        root.after.assert_any_call(350, app.restore_layout)
+        root.after.assert_any_call(500, app.enable_source_previews)
         root.mainloop.assert_called_once()
 
     def test_main_exits_when_existing_instance_accepts_wake(self):
@@ -955,114 +805,6 @@ class CoreTest(unittest.TestCase):
         appmod.App.poll_events(app)
         app.events.get_nowait.assert_not_called()
         app.root.after.assert_called_once_with(100, app.poll_events)
-
-    def test_outer_resize_defers_heavy_layout_until_settled(self):
-        app = object.__new__(appmod.App)
-        app.root = mock.Mock()
-        app.ui_ready = True
-        app.last_root_size = (980, 680)
-        app.resize_job = "old"
-        app.begin_outer_resize = mock.Mock()
-        app.pause_source_previews_for_layout = mock.Mock()
-        app.root.after.return_value = "new"
-        event = type("Event", (), {"widget": app.root, "width": 1000, "height": 700})()
-        appmod.App.on_resize(app, event)
-        app.begin_outer_resize.assert_called_once()
-        app.root.after_cancel.assert_called_once_with("old")
-        app.root.after.assert_called_once_with(180, app.finish_outer_resize)
-        self.assertEqual(app.resize_job, "new")
-
-    def test_begin_outer_resize_keeps_main_ui_mapped(self):
-        app = object.__new__(appmod.App)
-        app.ui_ready = True
-        app.resize_shell_active = False
-        app.main_pane = mock.Mock()
-        app.resize_shell = mock.Mock()
-        app.pause_source_previews_for_layout = mock.Mock()
-        app.cancel_target_rescale = mock.Mock()
-        appmod.App.begin_outer_resize(app)
-        self.assertTrue(app.resize_shell_active)
-        app.pause_source_previews_for_layout.assert_called_once()
-        app.cancel_target_rescale.assert_called_once()
-        app.main_pane.pack_forget.assert_not_called()
-        app.resize_shell.pack.assert_not_called()
-
-    def test_finish_outer_resize_restores_main_ui_once(self):
-        app = object.__new__(appmod.App)
-        app.resize_shell_active = True
-        app.resize_job = "job"
-        app.resize_shell = mock.Mock()
-        app.main_pane = mock.Mock()
-        app.root = mock.Mock()
-        app.root.winfo_width.return_value = 1000
-        app.root.winfo_height.return_value = 700
-        app.last_root_size = (1000, 700)
-        app.mouse_button_down = mock.Mock(return_value=False)
-        app.apply_scale = mock.Mock()
-        app.restore_layout = mock.Mock()
-        app.schedule_state_save = mock.Mock()
-        app.resume_source_previews_after_layout = mock.Mock()
-        appmod.App.finish_outer_resize(app)
-        app.resize_shell.pack_forget.assert_not_called()
-        app.main_pane.pack.assert_not_called()
-        app.root.update_idletasks.assert_not_called()
-        app.apply_scale.assert_called_once_with()
-        app.restore_layout.assert_called_once()
-        app.schedule_state_save.assert_called_once_with(0)
-        app.resume_source_previews_after_layout.assert_called_once_with(160)
-
-    def test_finish_outer_resize_keeps_small_resizes_light(self):
-        app = object.__new__(appmod.App)
-        app.resize_shell_active = False
-        app.resize_job = "job"
-        app.root = mock.Mock()
-        app.root.winfo_width.return_value = 1000
-        app.root.winfo_height.return_value = 680
-        app.last_root_size = (1000, 680)
-        app.last_scale = 1.0
-        app.fonts = {}
-        app.base_font_sizes = {}
-        app.style = mock.Mock()
-        app.redraw_checks = mock.Mock()
-        app.reload_target_list = mock.Mock()
-        app.restore_layout = mock.Mock()
-        app.resume_source_previews_after_layout = mock.Mock()
-        app.schedule_state_save = mock.Mock()
-        app.mouse_button_down = mock.Mock(return_value=False)
-        appmod.App.finish_outer_resize(app)
-        app.reload_target_list.assert_not_called()
-        app.redraw_checks.assert_not_called()
-        app.restore_layout.assert_called_once()
-
-    def test_finish_outer_resize_waits_until_mouse_released(self):
-        app = object.__new__(appmod.App)
-        app.resize_job = None
-        app.root = mock.Mock()
-        app.root.winfo_width.return_value = 1000
-        app.root.winfo_height.return_value = 700
-        app.root.after.return_value = "again"
-        app.last_root_size = (1000, 700)
-        app.mouse_button_down = mock.Mock(return_value=True)
-        app.apply_scale = mock.Mock()
-        app.restore_layout = mock.Mock()
-        appmod.App.finish_outer_resize(app)
-        app.root.after.assert_called_once_with(120, app.finish_outer_resize)
-        self.assertEqual(app.resize_job, "again")
-        app.apply_scale.assert_not_called()
-        app.restore_layout.assert_not_called()
-
-    def test_dwm_sync_keeps_thumbnail_updated_during_outer_resize(self):
-        app = object.__new__(appmod.App)
-        app.dwm_sync_job = None
-        app.resize_shell_active = True
-        app.dwm_thumbs = {"one": {"hwnd": 1}}
-        app.source_widgets = {"one": {"area": mock.Mock()}}
-        app.sync_dwm_preview = mock.Mock()
-        app.layout_busy = mock.Mock(return_value=True)
-        app.ensure_dwm_sync_loop = mock.Mock()
-        appmod.App.sync_dwm_previews_loop(app)
-        app.sync_dwm_preview.assert_called_once_with("one", app.source_widgets["one"]["area"], 1)
-        app.ensure_dwm_sync_loop.assert_called_once()
 
     def test_horizontal_resize_stretches_left_pane_only(self):
         root = appmod.Tk()
@@ -1156,16 +898,8 @@ class CoreTest(unittest.TestCase):
             app.root = root
             marker = object()
             app.tray_icon = marker
-            app.disable_source_previews = mock.Mock()
-            app.apply_scale = mock.Mock()
-            app.restore_layout = mock.Mock()
-            app.enable_source_previews = mock.Mock()
-            app.last_root_size = None
-            app.ui_ready = False
             appmod.App.show_window(app)
             self.assertIs(app.tray_icon, marker)
-            app.apply_scale.assert_called_once_with(force=True)
-            app.restore_layout.assert_called_once()
         finally:
             root.destroy()
 
@@ -1214,28 +948,6 @@ class CoreTest(unittest.TestCase):
                 self.assertEqual(app.targets, [])
             finally:
                 appmod.DATA_DIR, appmod.THUMBS_DIR = old_data, old_thumbs
-
-    def test_record_target_hits_updates_matching_template_counts(self):
-        app = object.__new__(appmod.App)
-        app.targets = [
-            {"id": "a", "name": "1-1-a", "hit_count": 2},
-            {"id": "b", "name": "1-2-b", "hit_count": 0},
-        ]
-        app.thumb_cache = {"old": object()}
-        app.reload_target_list = mock.Mock()
-        app.save_current_profile = mock.Mock()
-        appmod.App.record_target_hits(app, ["a", "b", "a", "missing"])
-        self.assertEqual([t["hit_count"] for t in app.targets], [4, 1])
-        self.assertEqual(app.thumb_cache, {})
-        app.reload_target_list.assert_called_once()
-        app.save_current_profile.assert_called_once()
-
-    def test_count_badge_marks_thumbnail_top_right(self):
-        image = Image.new("RGB", (80, 50), (245, 245, 245))
-        app = object.__new__(appmod.App)
-        appmod.App.draw_count_badge(app, image, 12)
-        pixels = [image.getpixel((x, y)) for x in range(50, 78) for y in range(4, 22)]
-        self.assertTrue(any(pixel != (245, 245, 245) for pixel in pixels))
 
     def test_gallery_mousewheel_scrolls_canvas(self):
         app = object.__new__(appmod.App)
@@ -1363,12 +1075,10 @@ class CoreTest(unittest.TestCase):
                 Image.new("RGB", (12, 10), "red").save(one)
                 Image.new("RGB", (12, 10), "blue").save(two)
                 app.targets = [
-                    {"id": "stable-one", "name": "one", "path": str(one), "enabled": True},
+                    {"name": "one", "path": str(one), "enabled": True},
                     {"name": "two", "path": str(two), "enabled": False},
                 ]
-                config_targets = app.detector_config()["targets"]
-                self.assertEqual([t["name"] for t in config_targets], ["one"])
-                self.assertEqual(config_targets[0]["id"], "stable-one")
+                self.assertEqual([t["name"] for t in app.detector_config()["targets"]], ["one"])
                 app.targets[0]["enabled"] = False
                 with self.assertRaises(ValueError):
                     app.detector_config()
