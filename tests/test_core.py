@@ -870,9 +870,31 @@ class CoreTest(unittest.TestCase):
         appmod.App.finish_outer_resize(app)
         app.resize_shell.pack_forget.assert_called_once()
         app.main_pane.pack.assert_called_once_with(fill="both", expand=True, padx=12, pady=12)
-        app.apply_scale.assert_called_once_with(force=True)
+        app.apply_scale.assert_called_once_with()
         app.restore_layout.assert_called_once()
         app.resume_source_previews_after_layout.assert_called_once_with(160)
+
+    def test_finish_outer_resize_keeps_small_resizes_light(self):
+        app = object.__new__(appmod.App)
+        app.resize_shell_active = False
+        app.resize_job = "job"
+        app.root = mock.Mock()
+        app.root.winfo_width.return_value = 1000
+        app.root.winfo_height.return_value = 680
+        app.last_root_size = (1000, 680)
+        app.last_scale = 1.0
+        app.fonts = {}
+        app.base_font_sizes = {}
+        app.style = mock.Mock()
+        app.redraw_checks = mock.Mock()
+        app.reload_target_list = mock.Mock()
+        app.restore_layout = mock.Mock()
+        app.resume_source_previews_after_layout = mock.Mock()
+        app.mouse_button_down = mock.Mock(return_value=False)
+        appmod.App.finish_outer_resize(app)
+        app.reload_target_list.assert_not_called()
+        app.redraw_checks.assert_not_called()
+        app.restore_layout.assert_called_once()
 
     def test_finish_outer_resize_waits_until_mouse_released(self):
         app = object.__new__(appmod.App)

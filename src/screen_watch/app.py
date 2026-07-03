@@ -1776,7 +1776,7 @@ class App:
             except TclError:
                 pass
             self.root.update_idletasks()
-        self.apply_scale(force=True)
+        self.apply_scale()
         self.restore_layout()
         self.resize_active_until = 0
         self.resume_source_previews_after_layout(160)
