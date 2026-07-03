@@ -902,6 +902,21 @@ class CoreTest(unittest.TestCase):
         app.root.after.assert_called_once_with(180, app.finish_outer_resize)
         self.assertEqual(app.resize_job, "new")
 
+    def test_begin_outer_resize_keeps_main_ui_mapped(self):
+        app = object.__new__(appmod.App)
+        app.ui_ready = True
+        app.resize_shell_active = False
+        app.main_pane = mock.Mock()
+        app.resize_shell = mock.Mock()
+        app.pause_source_previews_for_layout = mock.Mock()
+        app.cancel_target_rescale = mock.Mock()
+        appmod.App.begin_outer_resize(app)
+        self.assertTrue(app.resize_shell_active)
+        app.pause_source_previews_for_layout.assert_called_once()
+        app.cancel_target_rescale.assert_called_once()
+        app.main_pane.pack_forget.assert_not_called()
+        app.resize_shell.pack.assert_not_called()
+
     def test_finish_outer_resize_restores_main_ui_once(self):
         app = object.__new__(appmod.App)
         app.resize_shell_active = True
@@ -913,8 +928,9 @@ class CoreTest(unittest.TestCase):
         app.restore_layout = mock.Mock()
         app.resume_source_previews_after_layout = mock.Mock()
         appmod.App.finish_outer_resize(app)
-        app.resize_shell.pack_forget.assert_called_once()
-        app.main_pane.pack.assert_called_once_with(fill="both", expand=True, padx=12, pady=12)
+        app.resize_shell.pack_forget.assert_not_called()
+        app.main_pane.pack.assert_not_called()
+        app.root.update_idletasks.assert_not_called()
         app.apply_scale.assert_called_once_with()
         app.restore_layout.assert_called_once()
         app.resume_source_previews_after_layout.assert_called_once_with(160)

@@ -1756,15 +1756,10 @@ class App:
     def begin_outer_resize(self):
         if not getattr(self, "ui_ready", True) or getattr(self, "resize_shell_active", False):
             return
-        if not hasattr(self, "main_pane") or not hasattr(self, "resize_shell"):
-            return
         self.pause_source_previews_for_layout()
+        if hasattr(self, "cancel_target_rescale"):
+            self.cancel_target_rescale()
         self.resize_shell_active = True
-        try:
-            self.main_pane.pack_forget()
-            self.resize_shell.pack(fill="both", expand=True, padx=12, pady=12)
-        except TclError:
-            pass
 
     def finish_outer_resize(self):
         self.resize_job = None
@@ -1774,12 +1769,6 @@ class App:
             return
         if getattr(self, "resize_shell_active", False):
             self.resize_shell_active = False
-            try:
-                self.resize_shell.pack_forget()
-                self.main_pane.pack(fill="both", expand=True, padx=12, pady=12)
-            except TclError:
-                pass
-            self.root.update_idletasks()
         self.apply_scale()
         self.restore_layout()
         self.resize_active_until = 0
