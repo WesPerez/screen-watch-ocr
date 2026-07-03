@@ -58,11 +58,18 @@ DIB_RGB_COLORS = 0
 PW_RENDERFULLCONTENT = 0x00000002
 GW_OWNER = 4
 GWL_EXSTYLE = -20
+GWL_WNDPROC = -4
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 DWMWA_CLOAKED = 14
 DWM_TNP_RECTDESTINATION = 0x1
 DWM_TNP_OPACITY = 0x4
 DWM_TNP_VISIBLE = 0x8
+WM_SETREDRAW = 0x000B
+WM_ENTERSIZEMOVE = 0x0231
+WM_EXITSIZEMOVE = 0x0232
+RDW_INVALIDATE = 0x0001
+RDW_ALLCHILDREN = 0x0080
+RDW_UPDATENOW = 0x0100
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
 PREVIEW_W = 340
@@ -72,6 +79,7 @@ SOURCE_PREVIEW_SYNC_MS = 250
 DWM_PREVIEW_SYNC_MS = 33
 TARGET_RESCALE_BATCH = 1
 MIN_SCAN_INTERVAL_MS = 120
+RESIZE_SETTLE_SECONDS = 0.35
 VK_LBUTTON = 0x01
 INSTANCE_HOST = "127.0.0.1"
 INSTANCE_PORT = 47627
@@ -963,9 +971,17 @@ class App:
         self.thumb_h = 72
         self.last_scale = 1.0
         self.resize_job = None
+        self.state_save_job = None
         self.resize_shell = None
         self.resize_shell_active = False
+        self.native_resize_active = False
+        self.outer_resize_changed = False
+        self.native_wndproc = None
+        self.native_wndproc_prev = None
+        self.native_wndproc_hwnd = None
+        self.redraw_frozen = False
         self.last_root_size = None
+        self.last_resize_at = 0
         self.resize_active_until = 0
         self.move_active_until = 0
         self.layout_active_until = 0
@@ -1032,6 +1048,7 @@ class App:
         self.root.bind_all("<Control-V>", self.handle_paste_hotkey)
         self.root.bind("<Configure>", self.on_resize)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.install_native_resize_hook()
 
     def _build(self):
         self.main_pane = PanedWindow(
@@ -1759,19 +1776,100 @@ class App:
         self.pause_source_previews_for_layout()
         if hasattr(self, "cancel_target_rescale"):
             self.cancel_target_rescale()
+        self.freeze_window_redraw(True)
         self.resize_shell_active = True
+        self.outer_resize_changed = False
+
+    def install_native_resize_hook(self):
+        if os.name != "nt" or getattr(self, "native_wndproc", None):
+            return
+        hwnd = hwnd_for_tk(self.root)
+        if not hwnd:
+            return
+        try:
+            user32 = ctypes.windll.user32
+            lresult = getattr(wintypes, "LRESULT", ctypes.c_ssize_t)
+            wndproc_type = ctypes.WINFUNCTYPE(lresult, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+            set_wndproc = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+            set_wndproc.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+            set_wndproc.restype = ctypes.c_void_p
+            user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            user32.CallWindowProcW.restype = lresult
+
+            def proc(hwnd_arg, msg, wparam, lparam):
+                try:
+                    if msg == WM_ENTERSIZEMOVE:
+                        self.native_resize_active = True
+                        self.begin_outer_resize()
+                    elif msg == WM_EXITSIZEMOVE:
+                        self.native_resize_active = False
+                        self.resize_active_until = time.time() + 0.3
+                        if getattr(self, "resize_job", None):
+                            self.root.after_cancel(self.resize_job)
+                        self.resize_job = self.root.after(80, self.finish_outer_resize)
+                        self.schedule_state_save()
+                except Exception:
+                    pass
+                return user32.CallWindowProcW(self.native_wndproc_prev, hwnd_arg, msg, wparam, lparam)
+
+            callback = wndproc_type(proc)
+            prev = set_wndproc(wintypes.HWND(hwnd), GWL_WNDPROC, ctypes.cast(callback, ctypes.c_void_p).value)
+            if not prev:
+                return
+            self.native_wndproc = callback
+            self.native_wndproc_prev = prev
+            self.native_wndproc_hwnd = hwnd
+        except Exception:
+            self.native_wndproc = None
+            self.native_wndproc_prev = None
+            self.native_wndproc_hwnd = None
+
+    def restore_native_resize_hook(self):
+        if os.name != "nt" or not getattr(self, "native_wndproc_prev", None):
+            return
+        try:
+            user32 = ctypes.windll.user32
+            set_wndproc = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+            set_wndproc(wintypes.HWND(self.native_wndproc_hwnd), GWL_WNDPROC, self.native_wndproc_prev)
+        except Exception:
+            pass
+        self.native_wndproc = None
+        self.native_wndproc_prev = None
+        self.native_wndproc_hwnd = None
+
+    def freeze_window_redraw(self, frozen):
+        if os.name != "nt" or getattr(self, "redraw_frozen", False) == bool(frozen):
+            return
+        if not getattr(self, "root", None):
+            return
+        hwnd = hwnd_for_tk(self.root)
+        if not hwnd:
+            return
+        configure_winapi()
+        try:
+            ctypes.windll.user32.SendMessageW(hwnd, WM_SETREDRAW, 0 if frozen else 1, 0)
+            if not frozen:
+                ctypes.windll.user32.RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW)
+            self.redraw_frozen = bool(frozen)
+        except Exception:
+            self.redraw_frozen = False
 
     def finish_outer_resize(self):
         self.resize_job = None
-        if getattr(self, "mouse_button_down", lambda: False)():
+        actual_size = (max(1, self.root.winfo_width()), max(1, self.root.winfo_height()))
+        recently_resized = time.time() - getattr(self, "last_resize_at", 0) < RESIZE_SETTLE_SECONDS
+        if getattr(self, "native_resize_active", False) or getattr(self, "mouse_button_down", lambda: False)() or recently_resized or actual_size != self.last_root_size:
             self.resize_active_until = time.time() + 0.3
             self.resize_job = self.root.after(120, self.finish_outer_resize)
             return
         if getattr(self, "resize_shell_active", False):
             self.resize_shell_active = False
-        self.apply_scale()
-        self.restore_layout()
+        if getattr(self, "outer_resize_changed", True):
+            self.apply_scale()
+            self.restore_layout()
         self.resize_active_until = 0
+        self.freeze_window_redraw(False)
+        self.schedule_state_save(0)
         self.resume_source_previews_after_layout(160)
 
     def schedule_source_previews(self, delay):
@@ -1857,6 +1955,8 @@ class App:
     def sync_dwm_previews_loop(self):
         self.dwm_sync_job = None
         try:
+            if getattr(self, "resize_shell_active", False) or getattr(self, "native_resize_active", False):
+                return
             for key, record in list(self.dwm_thumbs.items()):
                 widgets = self.source_widgets.get(key)
                 if widgets:
@@ -2054,6 +2154,21 @@ class App:
     def profile_path(self, number=None):
         return PROFILES_DIR / f"profile_{number or self.current_profile}.json"
 
+    def schedule_state_save(self, delay=450):
+        if getattr(self, "state_save_job", None):
+            try:
+                self.root.after_cancel(self.state_save_job)
+            except TclError:
+                pass
+        try:
+            self.state_save_job = self.root.after(delay, self.run_scheduled_state_save)
+        except TclError:
+            self.state_save_job = None
+
+    def run_scheduled_state_save(self):
+        self.state_save_job = None
+        self.save_state()
+
     def save_state(self):
         self.capture_layout_ratios()
         write_json(
@@ -2200,6 +2315,8 @@ class App:
     def exit_app(self):
         self.save_current_profile()
         self.save_state()
+        self.freeze_window_redraw(False)
+        self.restore_native_resize_hook()
         self.stop_event.set()
         self.close_event.set()
         if self.instance_socket:
@@ -2214,6 +2331,12 @@ class App:
             except TclError:
                 pass
             self.preview_job = None
+        if self.state_save_job:
+            try:
+                self.root.after_cancel(self.state_save_job)
+            except TclError:
+                pass
+            self.state_save_job = None
         if self.dwm_sync_job:
             try:
                 self.root.after_cancel(self.dwm_sync_job)
@@ -2237,6 +2360,7 @@ class App:
 
     def hide_to_tray(self):
         self.disable_source_previews()
+        self.freeze_window_redraw(False)
         self.root.withdraw()
         if not self.ensure_tray_icon(show_errors=True):
             self.enable_source_previews(250)
@@ -2331,6 +2455,7 @@ class App:
         size = (event.width, event.height)
         if size == self.last_root_size:
             self.move_active_until = time.time() + 0.3
+            self.schedule_state_save()
             return
         if not getattr(self, "ui_ready", True):
             self.last_root_size = size
@@ -2338,6 +2463,8 @@ class App:
         self.begin_outer_resize()
         self.pause_source_previews_for_layout()
         self.last_root_size = size
+        self.outer_resize_changed = True
+        self.last_resize_at = time.time()
         self.resize_active_until = time.time() + 0.3
         if self.resize_job:
             self.root.after_cancel(self.resize_job)
