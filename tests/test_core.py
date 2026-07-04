@@ -1298,6 +1298,10 @@ class CoreTest(unittest.TestCase):
                 config_targets = app.detector_config()["targets"]
                 self.assertEqual([t["name"] for t in config_targets], ["one"])
                 self.assertEqual([t["id"] for t in config_targets], ["one-id"])
+                config = app.detector_config()
+                self.assertEqual(config["source_workers"], appmod.SCAN_SOURCE_WORKERS)
+                self.assertEqual(config["template_workers"], appmod.SCAN_TEMPLATE_WORKERS)
+                self.assertEqual(config["min_idle_seconds"], appmod.SCAN_MIN_IDLE_SECONDS)
                 app.targets[0]["enabled"] = False
                 with self.assertRaises(ValueError):
                     app.detector_config()
@@ -1306,6 +1310,31 @@ class CoreTest(unittest.TestCase):
                 appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH = old_data, old_profiles, old_state
                 appmod.LEGACY_DATA_DIR = old_legacy
                 appmod.THUMBS_DIR, appmod.ALERTS_DIR = old_thumbs, old_alerts
+
+    def test_detector_uses_configured_template_worker_limit(self):
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            one = base / "one.png"
+            two = base / "two.png"
+            Image.new("RGB", (4, 4), "red").save(one)
+            Image.new("RGB", (4, 4), "blue").save(two)
+            config = {
+                "_base_dir": str(base),
+                "template_workers": 2,
+                "targets": [
+                    {"name": "one", "kind": "template", "path": str(one), "threshold": 0.9, "scales": [1.0]},
+                    {"name": "two", "kind": "template", "path": str(two), "threshold": 0.9, "scales": [1.0]},
+                ],
+            }
+            detector = Detector(config)
+            frame = np.zeros((20, 20, 3), dtype=np.uint8)
+            with mock.patch.object(coremod, "ThreadPoolExecutor") as executor:
+                pool = executor.return_value.__enter__.return_value
+                pool.map.side_effect = lambda _fn, jobs: [(job[0], None) for job in jobs]
+                detector.run(frame)
+                executor.assert_called_once_with(max_workers=2, initializer=coremod.enter_background_work_mode)
 
     def test_detector_config_allows_window_only_source(self):
         old_data, old_profiles, old_state = appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH

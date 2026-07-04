@@ -21,6 +21,7 @@ QUARTER_AREA = 3840 * 2160
 COARSE_CANDIDATES = 3
 REFINE_MARGIN = 16
 TEMPLATE_WORKERS = 8
+THREAD_MODE_BACKGROUND_BEGIN = 0x00010000
 
 
 def parse_scales(value):
@@ -168,6 +169,18 @@ def capture_region(sct, region):
     return np.frombuffer(shot.rgb, dtype=np.uint8).reshape(shot.height, shot.width, 3)
 
 
+def enter_background_work_mode():
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetThreadPriority(kernel32.GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN)
+    except Exception:
+        pass
+
+
 def save_rgb(path, frame, matches=None):
     img = Image.fromarray(frame)
     if matches:
@@ -216,6 +229,7 @@ class Detector:
     def __init__(self, config):
         self.base_dir = Path(config["_base_dir"])
         self.targets = config["targets"]
+        self.template_workers = max(1, int(config.get("template_workers", TEMPLATE_WORKERS)))
         self.templates = {}
         self.ocr = None
         if any(t.get("kind") == "ocr_text" for t in self.targets):
@@ -271,7 +285,7 @@ class Detector:
         if template_jobs:
             frames = self._frames_for(gray, template_jobs)
             if len(template_jobs) > 1:
-                with ThreadPoolExecutor(max_workers=min(TEMPLATE_WORKERS, len(template_jobs))) as pool:
+                with ThreadPoolExecutor(max_workers=min(self.template_workers, len(template_jobs)), initializer=enter_background_work_mode) as pool:
                     for index, hit in pool.map(lambda job: (job[0], self._template(frames, job[1])), template_jobs):
                         hits[index] = hit
             else:

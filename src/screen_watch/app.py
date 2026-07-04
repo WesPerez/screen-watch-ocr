@@ -26,7 +26,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageGrab, ImageTk
 
-from .core import Detector, capture_region, config_regions, list_monitors, parse_scales, save_rgb
+from .core import Detector, capture_region, config_regions, enter_background_work_mode, list_monitors, parse_scales, save_rgb
 
 
 APP_NAME = "ScreenWatchOCR"
@@ -72,6 +72,9 @@ SOURCE_PREVIEW_SYNC_MS = 250
 DWM_PREVIEW_SYNC_MS = 33
 RESTORE_OVERLAY_CLEAR_MS = 120
 MIN_SCAN_INTERVAL_MS = 120
+SCAN_SOURCE_WORKERS = 1
+SCAN_TEMPLATE_WORKERS = 2
+SCAN_MIN_IDLE_SECONDS = 0.08
 VK_LBUTTON = 0x01
 INSTANCE_HOST = "127.0.0.1"
 INSTANCE_PORT = 47627
@@ -1832,6 +1835,7 @@ class App:
         try:
             from mss import mss
 
+            enter_background_work_mode()
             with mss() as sct:
                 while not self.close_event.is_set():
                     if not getattr(self, "source_previews_enabled", True):
@@ -2346,6 +2350,9 @@ class App:
             ],
             "cooldown_seconds": float(self.cooldown.get()),
             "poll_interval_seconds": interval_ms / 1000,
+            "source_workers": SCAN_SOURCE_WORKERS,
+            "template_workers": SCAN_TEMPLATE_WORKERS,
+            "min_idle_seconds": SCAN_MIN_IDLE_SECONDS,
             "alarm": {"beep": bool(self.beep.get()), "beep_seconds": beep_seconds, "beep_volume": beep_volume, "save_dir": "screenshots", "jsonl": "alerts.jsonl", "max_alerts": max_alerts},
         }
 
@@ -2386,10 +2393,11 @@ class App:
     def run_worker(self, config, once):
         from mss import mss
 
+        enter_background_work_mode()
         detector = Detector(config)
         last_seen = {}
         parallel_detect = not any(t.get("kind") == "ocr_text" for t in config.get("targets", []))
-        max_workers = max(1, min(4, os.cpu_count() or 1))
+        max_workers = max(1, int(config.get("source_workers", SCAN_SOURCE_WORKERS)))
         window_capture_modes = {}
         try:
             with mss() as sct:
@@ -2398,7 +2406,7 @@ class App:
                 windows = config.get("windows", [])
                 window_apps = config.get("window_apps", [])
                 last_window_refresh = 0
-                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                with ThreadPoolExecutor(max_workers=max_workers, initializer=enter_background_work_mode) as pool:
                     while not self.stop_event.is_set():
                         started = time.perf_counter()
                         hit_count = 0
@@ -2433,7 +2441,8 @@ class App:
                         self.events.put(("tick", f"扫描 {len(regions)} 屏 / {len(windows)} 应用 / {len(config['targets'])} 图，用时 {elapsed * 1000:.0f} ms，命中 {hit_count}"))
                         if once:
                             return
-                        time.sleep(max(0.01, config["poll_interval_seconds"] - elapsed))
+                        idle = max(0, float(config.get("min_idle_seconds", SCAN_MIN_IDLE_SECONDS)))
+                        time.sleep(max(idle, config["poll_interval_seconds"] - elapsed))
         finally:
             self.events.put(("stopped", "已停止"))
 
