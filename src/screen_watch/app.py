@@ -2035,7 +2035,7 @@ class App:
             self.target_vars.append(enabled_var)
             thumb = self.make_thumb(target)
             self.thumb_refs.append(thumb)
-            image = Label(card, image=thumb, bg=bg, width=self.thumb_w, height=self.thumb_h)
+            image = Label(card, image=thumb, bg=bg, width=self.thumb_w, height=self.thumb_h, bd=1, relief="solid")
             image.place(x=6, y=6, width=self.thumb_w, height=self.thumb_h)
             check = ttk.Checkbutton(card, variable=enabled_var, command=lambda i=idx, v=enabled_var: self.toggle_target(i, v))
             check.place(x=7, y=7, width=18, height=18)

@@ -1277,6 +1277,34 @@ class CoreTest(unittest.TestCase):
         pixels = [image.getpixel((x, y)) for x in range(50, 78) for y in range(4, 22)]
         self.assertTrue(any(pixel != (245, 245, 245) for pixel in pixels))
 
+    def test_target_thumbnail_area_has_border(self):
+        root = appmod.Tk()
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "target.png"
+                Image.new("RGB", (12, 10), "red").save(path)
+                app = object.__new__(appmod.App)
+                app.gallery_inner = appmod.Frame(root)
+                app.thumb_refs = []
+                app.target_vars = []
+                app.target_cards = {}
+                app.thumb_cache = {}
+                app.thumb_w = 104
+                app.thumb_h = 72
+                app.last_scale = 1.0
+                app.selected_target = None
+                app.targets = [{"path": str(path), "enabled": True}]
+                app.fonts = {"TkDefaultFont": appmod.tkfont.nametofont("TkDefaultFont")}
+                app.target_canvas = mock.Mock()
+                app.status = mock.Mock()
+                appmod.App.reload_target_list(app)
+                _card, image_label, _text = app.target_cards[0]
+                self.assertEqual(image_label.cget("relief"), "solid")
+                self.assertEqual(int(image_label.cget("bd")), 1)
+        finally:
+            root.destroy()
+
     def test_gallery_mousewheel_scrolls_canvas(self):
         app = object.__new__(appmod.App)
         app.target_canvas = mock.Mock()
