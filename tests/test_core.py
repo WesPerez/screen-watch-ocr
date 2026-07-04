@@ -687,6 +687,29 @@ class CoreTest(unittest.TestCase):
             finally:
                 appmod.STATE_PATH = old_state
 
+    def test_autohide_scrollbar_only_maps_when_needed(self):
+        root = appmod.Tk()
+        try:
+            canvas = appmod.Canvas(root, width=100, height=100, highlightthickness=0)
+            canvas.pack(side="left", fill="both", expand=True)
+            scrollbar = appmod.ttk.Scrollbar(root, orient="vertical", command=canvas.yview)
+            app = object.__new__(appmod.App)
+            appmod.App.configure_autohide_scrollbar(app, canvas, scrollbar, side="right", fill="y")
+
+            canvas.configure(scrollregion=(0, 0, 100, 80))
+            root.update_idletasks()
+            self.assertFalse(scrollbar.winfo_ismapped())
+
+            canvas.configure(scrollregion=(0, 0, 100, 220))
+            root.update_idletasks()
+            self.assertTrue(scrollbar.winfo_ismapped())
+
+            canvas.configure(scrollregion=(0, 0, 100, 80))
+            root.update_idletasks()
+            self.assertFalse(scrollbar.winfo_ismapped())
+        finally:
+            root.destroy()
+
     def test_apply_scale_does_not_reset_panes_on_outer_resize(self):
         app = object.__new__(appmod.App)
         app.root = mock.Mock()

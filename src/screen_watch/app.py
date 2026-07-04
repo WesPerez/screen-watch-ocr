@@ -993,8 +993,7 @@ class App:
         preview_outer = ttk.Frame(self.main_pane, width=380)
         self.right_canvas = Canvas(right_outer, highlightthickness=0)
         right_scroll = ttk.Scrollbar(right_outer, orient="vertical", command=self.right_canvas.yview)
-        self.right_canvas.configure(yscrollcommand=right_scroll.set)
-        right_scroll.pack(side="right", fill="y")
+        self.configure_autohide_scrollbar(self.right_canvas, right_scroll, side="right", fill="y")
         self.right_canvas.pack(side="left", fill="both", expand=True)
         right = ttk.Frame(self.right_canvas)
         right_window = self.right_canvas.create_window((0, 0), window=right, anchor="nw")
@@ -1013,9 +1012,8 @@ class App:
         preview_box.pack(fill="both", expand=True)
         self.source_canvas = Canvas(preview_box, highlightthickness=0)
         source_scroll = ttk.Scrollbar(preview_box, orient="vertical", command=self.source_canvas.yview)
-        self.source_canvas.configure(yscrollcommand=source_scroll.set)
+        self.configure_autohide_scrollbar(self.source_canvas, source_scroll, side="right", fill="y")
         self.source_canvas.pack(side="left", fill="both", expand=True)
-        source_scroll.pack(side="right", fill="y")
         self.source_frame = ttk.Frame(self.source_canvas)
         self.source_window = self.source_canvas.create_window((0, 0), window=self.source_frame, anchor="nw")
         self.source_frame.bind("<Configure>", lambda _event: self.source_canvas.configure(scrollregion=self.source_canvas.bbox("all")))
@@ -1054,8 +1052,7 @@ class App:
         self.target_canvas = Canvas(gallery_box, highlightthickness=0, height=260)
         self.target_canvas.pack(side="left", fill="both", expand=True)
         scroll = ttk.Scrollbar(gallery_box, orient="vertical", command=self.target_canvas.yview)
-        scroll.pack(side="right", fill="y")
-        self.target_canvas.configure(yscrollcommand=scroll.set)
+        self.configure_autohide_scrollbar(self.target_canvas, scroll, side="right", fill="y")
         self.target_canvas.bind("<Button-1>", lambda _event: self.target_canvas.focus_set())
         self.target_canvas.bind("<MouseWheel>", self.scroll_targets)
         self.gallery_inner = ttk.Frame(self.target_canvas)
@@ -1198,6 +1195,19 @@ class App:
         widget.bind("<MouseWheel>", handler)
         for child in widget.winfo_children():
             self.bind_mousewheel(child, handler)
+
+    def configure_autohide_scrollbar(self, canvas, scrollbar, **pack_options):
+        def set_scroll(first, last):
+            first_value = float(first)
+            last_value = float(last)
+            if first_value <= 0.0 and last_value >= 1.0:
+                if scrollbar.winfo_ismapped():
+                    scrollbar.pack_forget()
+            elif not scrollbar.winfo_ismapped():
+                scrollbar.pack(**pack_options)
+            scrollbar.set(first, last)
+
+        canvas.configure(yscrollcommand=set_scroll)
 
     def is_descendant(self, widget, parent):
         while widget:
