@@ -47,7 +47,6 @@ def user_data_dir():
 DATA_DIR = user_data_dir()
 STATE_PATH = DATA_DIR / "state.json"
 PROFILES_DIR = DATA_DIR / "profiles"
-THUMBS_DIR = DATA_DIR / "thumbs"
 ALERTS_DIR = DATA_DIR / "screenshots"
 PROFILE_COUNT = 5
 TEMPLATE_NAME_RE = re.compile(r"^(\d+)-(\d+)-(.+)$")
@@ -351,7 +350,7 @@ def migrate_legacy_data():
         return
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        for name in ("profiles", "templates", "thumbs"):
+        for name in ("profiles", "templates"):
             src = LEGACY_DATA_DIR / name
             if src.exists():
                 shutil.copytree(src, DATA_DIR / name, dirs_exist_ok=True)
@@ -484,7 +483,7 @@ def normalize_target_record(target):
 
 def delete_target_files(target):
     removed = 0
-    for key, parent in (("path", DATA_DIR / "templates"), ("thumb", THUMBS_DIR)):
+    for key, parent in (("path", DATA_DIR / "templates"),):
         path = target.get(key)
         if path and is_under(path, parent):
             try:

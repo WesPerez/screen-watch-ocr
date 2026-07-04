@@ -440,56 +440,47 @@ class CoreTest(unittest.TestCase):
         self.assertRegex(template_name(5, 2), r"^5-2-\d{20}$")
 
     def test_normalize_target_names_fills_deleted_number_gap(self):
-        old_data, old_thumbs = appmod.DATA_DIR, appmod.THUMBS_DIR
+        old_data = appmod.DATA_DIR
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             appmod.DATA_DIR = base / "data"
-            appmod.THUMBS_DIR = appmod.DATA_DIR / "thumbs"
             try:
                 targets = []
                 for name in ("1-1-old-a", "1-3-old-b"):
                     template = appmod.DATA_DIR / "templates" / f"{name}.png"
-                    thumb = appmod.THUMBS_DIR / f"{name}.png"
                     template.parent.mkdir(parents=True, exist_ok=True)
-                    thumb.parent.mkdir(parents=True, exist_ok=True)
                     Image.new("RGB", (4, 4), "red").save(template)
-                    Image.new("RGB", (4, 4), "blue").save(thumb)
-                    targets.append({"name": name, "path": str(template), "thumb": str(thumb)})
+                    targets.append({"name": name, "path": str(template), "thumb": str(base / "legacy-thumb.png")})
                 renamed, changed = normalize_target_names(targets, 1)
                 self.assertTrue(changed)
                 self.assertEqual([Path(t["path"]).stem for t in renamed], ["1-1-old-a", "1-2-old-b"])
                 self.assertEqual([t["id"] for t in renamed], ["old-a", "old-b"])
                 self.assertEqual([t["hit_count"] for t in renamed], [0, 0])
                 self.assertNotIn("thumb", renamed[1])
-                self.assertTrue((appmod.THUMBS_DIR / "1-3-old-b.png").exists())
                 self.assertFalse((appmod.DATA_DIR / "templates" / "1-3-old-b.png").exists())
             finally:
-                appmod.DATA_DIR, appmod.THUMBS_DIR = old_data, old_thumbs
+                appmod.DATA_DIR = old_data
 
     def test_normalize_profile_file_updates_saved_paths(self):
-        old_data, old_profiles, old_thumbs = appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.THUMBS_DIR
+        old_data, old_profiles = appmod.DATA_DIR, appmod.PROFILES_DIR
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             appmod.DATA_DIR = base / "data"
             appmod.PROFILES_DIR = appmod.DATA_DIR / "profiles"
-            appmod.THUMBS_DIR = appmod.DATA_DIR / "thumbs"
             try:
                 targets = []
                 for name in ("1-1-old", "1-3-old"):
                     template = appmod.DATA_DIR / "templates" / f"{name}.png"
-                    thumb = appmod.THUMBS_DIR / f"{name}.png"
                     template.parent.mkdir(parents=True, exist_ok=True)
-                    thumb.parent.mkdir(parents=True, exist_ok=True)
                     Image.new("RGB", (4, 4), "red").save(template)
-                    Image.new("RGB", (4, 4), "blue").save(thumb)
-                    targets.append({"name": name, "path": str(template), "thumb": str(thumb)})
+                    targets.append({"name": name, "path": str(template), "thumb": str(base / "legacy-thumb.png")})
                 appmod.write_json(appmod.PROFILES_DIR / "profile_1.json", {"targets": targets})
                 self.assertTrue(normalize_profile_file(1))
                 data = appmod.load_json(appmod.PROFILES_DIR / "profile_1.json", {})
                 self.assertEqual([Path(t["path"]).stem for t in data["targets"]], ["1-1-old", "1-2-old"])
                 self.assertNotIn("thumb", data["targets"][0])
             finally:
-                appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.THUMBS_DIR = old_data, old_profiles, old_thumbs
+                appmod.DATA_DIR, appmod.PROFILES_DIR = old_data, old_profiles
 
     def test_window_selection_keys_and_legacy_profile(self):
         self.assertEqual(window_key("Demo", 2), "Demo" + "\0" + "2")
@@ -499,14 +490,13 @@ class CoreTest(unittest.TestCase):
     def test_profile_roundtrip(self):
         old_data, old_profiles, old_state = appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH
         old_legacy = appmod.LEGACY_DATA_DIR
-        old_thumbs, old_alerts = appmod.THUMBS_DIR, appmod.ALERTS_DIR
+        old_alerts = appmod.ALERTS_DIR
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             appmod.DATA_DIR = base / "app_data"
             appmod.LEGACY_DATA_DIR = base / "missing_legacy"
             appmod.PROFILES_DIR = appmod.DATA_DIR / "profiles"
             appmod.STATE_PATH = appmod.DATA_DIR / "state.json"
-            appmod.THUMBS_DIR = appmod.DATA_DIR / "thumbs"
             appmod.ALERTS_DIR = appmod.DATA_DIR / "screenshots"
             try:
                 root = appmod.Tk()
@@ -546,19 +536,18 @@ class CoreTest(unittest.TestCase):
             finally:
                 appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH = old_data, old_profiles, old_state
                 appmod.LEGACY_DATA_DIR = old_legacy
-                appmod.THUMBS_DIR, appmod.ALERTS_DIR = old_thumbs, old_alerts
+                appmod.ALERTS_DIR = old_alerts
 
     def test_profile_restores_no_selected_monitors(self):
         old_data, old_profiles, old_state = appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH
         old_legacy = appmod.LEGACY_DATA_DIR
-        old_thumbs, old_alerts = appmod.THUMBS_DIR, appmod.ALERTS_DIR
+        old_alerts = appmod.ALERTS_DIR
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             appmod.DATA_DIR = base / "app_data"
             appmod.LEGACY_DATA_DIR = base / "missing_legacy"
             appmod.PROFILES_DIR = appmod.DATA_DIR / "profiles"
             appmod.STATE_PATH = appmod.DATA_DIR / "state.json"
-            appmod.THUMBS_DIR = appmod.DATA_DIR / "thumbs"
             appmod.ALERTS_DIR = appmod.DATA_DIR / "screenshots"
             try:
                 root = appmod.Tk()
@@ -577,7 +566,7 @@ class CoreTest(unittest.TestCase):
             finally:
                 appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH = old_data, old_profiles, old_state
                 appmod.LEGACY_DATA_DIR = old_legacy
-                appmod.THUMBS_DIR, appmod.ALERTS_DIR = old_thumbs, old_alerts
+                appmod.ALERTS_DIR = old_alerts
 
     def test_entry_click_keeps_cursor_at_end(self):
         root = appmod.Tk()
@@ -1121,37 +1110,31 @@ class CoreTest(unittest.TestCase):
                 if app.instance_socket:
                     app.instance_socket.close()
 
-    def test_remove_selected_deletes_template_and_thumb_files(self):
-        old_data, old_thumbs = appmod.DATA_DIR, appmod.THUMBS_DIR
+    def test_remove_selected_deletes_template_file(self):
+        old_data = appmod.DATA_DIR
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             appmod.DATA_DIR = base / "data"
-            appmod.THUMBS_DIR = appmod.DATA_DIR / "thumbs"
             template = appmod.DATA_DIR / "templates" / "one.png"
-            thumb = appmod.THUMBS_DIR / "one.png"
             template.parent.mkdir(parents=True)
-            thumb.parent.mkdir(parents=True)
             template.write_bytes(b"x")
-            thumb.write_bytes(b"x")
             try:
                 app = object.__new__(appmod.App)
-                app.targets = [{"path": str(template), "thumb": str(thumb)}]
+                app.targets = [{"path": str(template)}]
                 app.selected_target = 0
                 app.reload_target_list = lambda: None
                 app.save_current_profile = lambda: None
                 appmod.App.remove_selected(app)
                 self.assertFalse(template.exists())
-                self.assertFalse(thumb.exists())
                 self.assertEqual(app.targets, [])
             finally:
-                appmod.DATA_DIR, appmod.THUMBS_DIR = old_data, old_thumbs
+                appmod.DATA_DIR = old_data
 
     def test_reorder_target_renames_files_by_new_position(self):
-        old_data, old_thumbs = appmod.DATA_DIR, appmod.THUMBS_DIR
+        old_data = appmod.DATA_DIR
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             appmod.DATA_DIR = base / "data"
-            appmod.THUMBS_DIR = appmod.DATA_DIR / "thumbs"
             try:
                 app = object.__new__(appmod.App)
                 app.current_profile = 1
@@ -1164,7 +1147,7 @@ class CoreTest(unittest.TestCase):
                     path = appmod.DATA_DIR / "templates" / f"{stem}.png"
                     path.parent.mkdir(parents=True, exist_ok=True)
                     Image.new("RGB", (4, 4), "red").save(path)
-                    app.targets.append({"id": stem.rsplit("-", 1)[-1], "name": stem, "path": str(path), "thumb": str(appmod.THUMBS_DIR / f"{stem}.png")})
+                    app.targets.append({"id": stem.rsplit("-", 1)[-1], "name": stem, "path": str(path), "thumb": str(base / f"{stem}.legacy.png")})
                 self.assertTrue(appmod.App.reorder_target(app, 0, len(app.targets)))
                 self.assertEqual([target["id"] for target in app.targets], ["b", "c", "a"])
                 self.assertEqual([Path(target["path"]).stem for target in app.targets], ["1-1-b", "1-2-c", "1-3-a"])
@@ -1174,7 +1157,7 @@ class CoreTest(unittest.TestCase):
                 app.reload_target_list.assert_called_once()
                 app.save_current_profile.assert_called_once()
             finally:
-                appmod.DATA_DIR, appmod.THUMBS_DIR = old_data, old_thumbs
+                appmod.DATA_DIR = old_data
 
     def test_target_drop_index_uses_card_midpoints(self):
         class Card:
@@ -1342,14 +1325,13 @@ class CoreTest(unittest.TestCase):
 
     def test_detector_config_uses_only_checked_targets(self):
         old_data, old_profiles, old_state = appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH
-        old_legacy, old_thumbs, old_alerts = appmod.LEGACY_DATA_DIR, appmod.THUMBS_DIR, appmod.ALERTS_DIR
+        old_legacy, old_alerts = appmod.LEGACY_DATA_DIR, appmod.ALERTS_DIR
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             appmod.DATA_DIR = base / "app_data"
             appmod.LEGACY_DATA_DIR = base / "missing_legacy"
             appmod.PROFILES_DIR = appmod.DATA_DIR / "profiles"
             appmod.STATE_PATH = appmod.DATA_DIR / "state.json"
-            appmod.THUMBS_DIR = appmod.DATA_DIR / "thumbs"
             appmod.ALERTS_DIR = appmod.DATA_DIR / "screenshots"
             try:
                 root = appmod.Tk()
@@ -1379,7 +1361,7 @@ class CoreTest(unittest.TestCase):
             finally:
                 appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH = old_data, old_profiles, old_state
                 appmod.LEGACY_DATA_DIR = old_legacy
-                appmod.THUMBS_DIR, appmod.ALERTS_DIR = old_thumbs, old_alerts
+                appmod.ALERTS_DIR = old_alerts
 
     def test_detector_uses_configured_template_worker_limit(self):
         import numpy as np
@@ -1408,14 +1390,13 @@ class CoreTest(unittest.TestCase):
 
     def test_detector_config_allows_window_only_source(self):
         old_data, old_profiles, old_state = appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH
-        old_legacy, old_thumbs, old_alerts = appmod.LEGACY_DATA_DIR, appmod.THUMBS_DIR, appmod.ALERTS_DIR
+        old_legacy, old_alerts = appmod.LEGACY_DATA_DIR, appmod.ALERTS_DIR
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             appmod.DATA_DIR = base / "app_data"
             appmod.LEGACY_DATA_DIR = base / "missing_legacy"
             appmod.PROFILES_DIR = appmod.DATA_DIR / "profiles"
             appmod.STATE_PATH = appmod.DATA_DIR / "state.json"
-            appmod.THUMBS_DIR = appmod.DATA_DIR / "thumbs"
             appmod.ALERTS_DIR = appmod.DATA_DIR / "screenshots"
             try:
                 root = appmod.Tk()
@@ -1440,18 +1421,17 @@ class CoreTest(unittest.TestCase):
             finally:
                 appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH = old_data, old_profiles, old_state
                 appmod.LEGACY_DATA_DIR = old_legacy
-                appmod.THUMBS_DIR, appmod.ALERTS_DIR = old_thumbs, old_alerts
+                appmod.ALERTS_DIR = old_alerts
 
     def test_add_image_prunes_to_template_limit_before_naming(self):
         old_data, old_profiles, old_state = appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH
-        old_legacy, old_thumbs, old_alerts = appmod.LEGACY_DATA_DIR, appmod.THUMBS_DIR, appmod.ALERTS_DIR
+        old_legacy, old_alerts = appmod.LEGACY_DATA_DIR, appmod.ALERTS_DIR
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             appmod.DATA_DIR = base / "app_data"
             appmod.LEGACY_DATA_DIR = base / "missing_legacy"
             appmod.PROFILES_DIR = appmod.DATA_DIR / "profiles"
             appmod.STATE_PATH = appmod.DATA_DIR / "state.json"
-            appmod.THUMBS_DIR = appmod.DATA_DIR / "thumbs"
             appmod.ALERTS_DIR = appmod.DATA_DIR / "screenshots"
             try:
                 root = appmod.Tk()
@@ -1466,12 +1446,12 @@ class CoreTest(unittest.TestCase):
                 self.assertTrue(Path(app.targets[0]["path"]).name.startswith("1-1-"))
                 self.assertTrue(Path(app.targets[1]["path"]).name.startswith("1-2-"))
                 self.assertTrue(all("thumb" not in target for target in app.targets))
-                self.assertFalse(any(appmod.THUMBS_DIR.glob("*.png")) if appmod.THUMBS_DIR.exists() else False)
+                self.assertFalse((appmod.DATA_DIR / "thumbs").exists())
                 root.destroy()
             finally:
                 appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH = old_data, old_profiles, old_state
                 appmod.LEGACY_DATA_DIR = old_legacy
-                appmod.THUMBS_DIR, appmod.ALERTS_DIR = old_thumbs, old_alerts
+                appmod.ALERTS_DIR = old_alerts
 
 
 if __name__ == "__main__":
