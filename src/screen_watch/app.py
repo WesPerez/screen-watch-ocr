@@ -63,6 +63,10 @@ DWMWA_CLOAKED = 14
 DWM_TNP_RECTDESTINATION = 0x1
 DWM_TNP_OPACITY = 0x4
 DWM_TNP_VISIBLE = 0x8
+RDW_INVALIDATE = 0x0001
+RDW_ALLCHILDREN = 0x0080
+RDW_UPDATENOW = 0x0100
+RDW_FRAME = 0x0400
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
 PREVIEW_W = 340
@@ -194,6 +198,8 @@ def configure_winapi():
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     user32.GetClassNameW.restype = ctypes.c_int
+    user32.RedrawWindow.argtypes = [wintypes.HWND, wintypes.LPRECT, wintypes.HRGN, wintypes.UINT]
+    user32.RedrawWindow.restype = wintypes.BOOL
     user32.GetWindowDC.argtypes = [wintypes.HWND]
     user32.GetWindowDC.restype = wintypes.HDC
     user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
@@ -870,6 +876,19 @@ def hwnd_for_tk(window):
             return 0
 
 
+def redraw_tk_window(window):
+    if os.name != "nt":
+        return
+    try:
+        configure_winapi()
+        hwnd = hwnd_for_tk(window)
+        if hwnd:
+            flags = RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME
+            ctypes.windll.user32.RedrawWindow(hwnd, None, None, flags)
+    except Exception:
+        pass
+
+
 def beep_wave(volume, milliseconds=180, frequency=1200, sample_rate=22050):
     volume = parse_volume(volume)
     frames = int(sample_rate * milliseconds / 1000)
@@ -954,6 +973,7 @@ class App:
         self.preview_lock = threading.Lock()
         self.preview_job = None
         self.source_previews_enabled = False
+        self.restore_from_unmap = False
         self.dwm_sync_job = None
         self.worker = None
         self.tray_icon = None
@@ -995,6 +1015,7 @@ class App:
         self.root.bind_all("<Control-v>", self.handle_paste_hotkey)
         self.root.bind_all("<Control-V>", self.handle_paste_hotkey)
         self.root.bind("<Configure>", self.on_resize)
+        self.root.bind("<Map>", self.on_window_mapped)
         self.root.bind("<Unmap>", self.on_window_unmapped)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         threading.Thread(target=self.run_preview_worker, daemon=True).start()
@@ -1696,26 +1717,6 @@ class App:
         if record:
             dwm_unregister(record["thumb"])
 
-    def show_preview_fallback(self, key):
-        widgets = getattr(self, "source_widgets", {}).get(key)
-        if not widgets:
-            return
-        try:
-            area = widgets["area"]
-            image = widgets["image"]
-            width = max(1, area.winfo_width() or PREVIEW_W)
-            height = max(1, area.winfo_height() or PREVIEW_H)
-            image.place(x=0, y=0, width=width, height=height)
-            if getattr(image, "image", None) and widgets.get("photo_size") == (width, height):
-                return
-            photo = self.placeholder_image("等待画面", width, height)
-            image.configure(image=photo)
-            image.image = photo
-            widgets["photo_frame_id"] = None
-            widgets["photo_size"] = (width, height)
-        except Exception:
-            pass
-
     def suspend_dwm_previews(self):
         if getattr(self, "dwm_sync_job", None):
             try:
@@ -1724,7 +1725,6 @@ class App:
                 pass
             self.dwm_sync_job = None
         for key in list(getattr(self, "dwm_thumbs", {})):
-            self.show_preview_fallback(key)
             self.unregister_dwm_preview(key)
 
     def schedule_source_previews(self, delay):
@@ -2170,6 +2170,7 @@ class App:
 
     def show_window(self):
         self.ensure_tray_icon(show_errors=False)
+        self.restore_from_unmap = False
         self.disable_source_previews()
         self.root.deiconify()
         self.root.lift()
@@ -2177,7 +2178,22 @@ class App:
             self.root.focus_force()
         except TclError:
             pass
+        self.schedule_window_repaint()
         self.enable_source_previews(250)
+
+    def schedule_window_repaint(self):
+        for delay in (0, 50, 150):
+            try:
+                self.root.after(delay, self.repaint_window)
+            except TclError:
+                return
+
+    def repaint_window(self):
+        try:
+            self.root.update_idletasks()
+        except TclError:
+            return
+        redraw_tk_window(self.root)
 
     def start_instance_listener(self, sock):
         self.instance_socket = sock
@@ -2248,7 +2264,14 @@ class App:
     def on_window_unmapped(self, event):
         if event.widget != self.root:
             return
-        self.suspend_dwm_previews()
+        self.restore_from_unmap = True
+        self.disable_source_previews()
+
+    def on_window_mapped(self, event):
+        if event.widget != self.root or not getattr(self, "restore_from_unmap", False):
+            return
+        self.restore_from_unmap = False
+        self.root.after(0, self.show_window)
 
     def apply_scale(self, force=False):
         self.resize_job = None

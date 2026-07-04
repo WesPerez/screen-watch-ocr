@@ -241,7 +241,7 @@ class CoreTest(unittest.TestCase):
             unregister.assert_called_once_with(thumb)
             self.assertEqual(app.dwm_thumbs, {})
 
-    def test_suspend_dwm_preview_restores_fallback_before_unregistering(self):
+    def test_suspend_dwm_preview_does_not_replace_underlay(self):
         app = object.__new__(appmod.App)
         thumb = object()
         image = mock.Mock()
@@ -257,9 +257,9 @@ class CoreTest(unittest.TestCase):
         with mock.patch.object(appmod, "dwm_unregister") as unregister:
             appmod.App.suspend_dwm_previews(app)
             app.root.after_cancel.assert_called_once_with("job")
-            image.place.assert_called_once_with(x=0, y=0, width=300, height=180)
-            image.configure.assert_called_once_with(image="photo")
-            self.assertEqual(image.image, "photo")
+            image.place.assert_not_called()
+            image.configure.assert_not_called()
+            app.placeholder_image.assert_not_called()
             unregister.assert_called_once_with(thumb)
 
     def test_layout_drag_suspends_dwm_preview(self):
@@ -1034,18 +1034,32 @@ class CoreTest(unittest.TestCase):
             app.root = root
             marker = object()
             app.tray_icon = marker
+            app.schedule_window_repaint = mock.Mock()
             appmod.App.show_window(app)
             self.assertIs(app.tray_icon, marker)
+            app.schedule_window_repaint.assert_called_once()
         finally:
             root.destroy()
 
-    def test_window_unmap_suspends_dwm_preview(self):
+    def test_window_unmap_disables_source_previews(self):
         app = object.__new__(appmod.App)
         app.root = mock.Mock()
-        app.suspend_dwm_previews = mock.Mock()
+        app.restore_from_unmap = False
+        app.disable_source_previews = mock.Mock()
         event = type("Event", (), {"widget": app.root})()
         appmod.App.on_window_unmapped(app, event)
-        app.suspend_dwm_previews.assert_called_once()
+        self.assertTrue(app.restore_from_unmap)
+        app.disable_source_previews.assert_called_once()
+
+    def test_window_map_uses_show_window_after_unmap(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.restore_from_unmap = True
+        app.show_window = mock.Mock()
+        event = type("Event", (), {"widget": app.root})()
+        appmod.App.on_window_mapped(app, event)
+        self.assertFalse(app.restore_from_unmap)
+        app.root.after.assert_called_once_with(0, app.show_window)
 
     def test_single_instance_notification_wakes_existing_app(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
