@@ -9,6 +9,7 @@ from unittest import mock
 from PIL import Image
 
 import screen_watch.app as appmod
+import screen_watch.core as coremod
 from screen_watch.app import app_from_legacy, beep_wave, black_fraction, crop_black_padding, mostly_black, normalize_profile_file, normalize_target_names, parse_positive_float, parse_positive_int, parse_scales, parse_volume, prune_alerts, scan_interval_ms, template_name, window_key
 from screen_watch.core import Detector, self_test
 
@@ -745,6 +746,28 @@ class CoreTest(unittest.TestCase):
         root.after.assert_any_call(350, app.restore_layout)
         root.after.assert_any_call(500, app.enable_source_previews)
         root.mainloop.assert_called_once()
+
+    def test_main_start_minimized_stays_in_tray(self):
+        root = mock.Mock()
+        root.winfo_width.return_value = 980
+        root.winfo_height.return_value = 680
+        app = mock.Mock()
+        with mock.patch.object(appmod, "claim_single_instance", return_value=False), mock.patch.object(appmod, "Tk", return_value=root), mock.patch.object(appmod, "App", return_value=app):
+            self.assertEqual(appmod.main(["--start-minimized"]), 0)
+        root.deiconify.assert_not_called()
+        root.lift.assert_not_called()
+        app.ensure_tray_icon.assert_called_once_with(show_errors=False)
+        root.after.assert_not_called()
+        root.mainloop.assert_called_once()
+
+    def test_core_app_forwards_start_minimized(self):
+        with mock.patch.object(appmod, "main", return_value=0) as app_main:
+            self.assertEqual(coremod.main(["app", "--start-minimized"]), 0)
+        app_main.assert_called_once_with(["--start-minimized"])
+
+    def test_startup_arguments_start_minimized(self):
+        self.assertEqual(appmod.startup_arguments(Path("ScreenWatchOCR.exe")), "--start-minimized")
+        self.assertEqual(appmod.startup_arguments(Path(sys.executable)), "-m screen_watch app --start-minimized")
 
     def test_main_exits_when_existing_instance_accepts_wake(self):
         with mock.patch.object(appmod, "claim_single_instance", return_value=None), mock.patch.object(appmod, "Tk") as tk:

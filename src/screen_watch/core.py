@@ -549,6 +549,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("app")
     p.add_argument("--smoke-test", action="store_true")
+    p.add_argument("--start-minimized", action="store_true")
     sub.add_parser("list-monitors")
     p = sub.add_parser("once")
     p.add_argument("--config", required=True)
@@ -572,7 +573,12 @@ def main(argv=None):
     if args.cmd == "app":
         from .app import main as app_main
 
-        return app_main(["--smoke-test"] if args.smoke_test else [])
+        app_args = []
+        if args.smoke_test:
+            app_args.append("--smoke-test")
+        if args.start_minimized:
+            app_args.append("--start-minimized")
+        return app_main(app_args)
     if args.cmd == "list-monitors":
         print(json.dumps(list_monitors(), indent=2))
         return 0

@@ -251,10 +251,10 @@ def ps_quote(value):
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def shortcut_target(path):
+def shortcut_info(path):
     if os.name != "nt" or not Path(path).exists():
-        return ""
-    script = f"$s=New-Object -ComObject WScript.Shell; $l=$s.CreateShortcut({ps_quote(path)}); Write-Output $l.TargetPath"
+        return {}
+    script = f"$s=New-Object -ComObject WScript.Shell; $l=$s.CreateShortcut({ps_quote(path)}); Write-Output $l.TargetPath; Write-Output $l.Arguments"
     result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
         capture_output=True,
@@ -262,7 +262,33 @@ def shortcut_target(path):
         creationflags=subprocess_flags(),
         timeout=10,
     )
-    return result.stdout.strip() if result.returncode == 0 else ""
+    if result.returncode != 0:
+        return {}
+    lines = result.stdout.splitlines()
+    return {"target": lines[0].strip() if lines else "", "arguments": lines[1].strip() if len(lines) > 1 else ""}
+
+
+def shortcut_target(path):
+    return shortcut_info(path).get("target", "")
+
+
+def startup_arguments(target=None):
+    target = Path(target or app_target_path())
+    if getattr(sys, "frozen", False):
+        return "--start-minimized"
+    try:
+        if target.resolve() == Path(sys.executable).resolve():
+            return "-m screen_watch app --start-minimized"
+    except Exception:
+        pass
+    return "--start-minimized"
+
+
+def startup_working_dir(target=None):
+    target = Path(target or app_target_path())
+    if not getattr(sys, "frozen", False) and target == Path(sys.executable):
+        return APP_DIR
+    return target.parent
 
 
 def is_startup_enabled(target=None):
@@ -281,12 +307,14 @@ def set_startup_enabled(enabled, target=None):
     target = Path(target or app_target_path()).resolve()
     if enabled:
         link.parent.mkdir(parents=True, exist_ok=True)
+        arguments = startup_arguments(target)
+        working_dir = startup_working_dir(target)
         script = (
             "$s=New-Object -ComObject WScript.Shell; "
             f"$l=$s.CreateShortcut({ps_quote(link)}); "
             f"$l.TargetPath={ps_quote(target)}; "
-            "$l.Arguments=''; "
-            f"$l.WorkingDirectory={ps_quote(target.parent)}; "
+            f"$l.Arguments={ps_quote(arguments)}; "
+            f"$l.WorkingDirectory={ps_quote(working_dir)}; "
             "$l.Save()"
         )
         result = subprocess.run(
@@ -303,6 +331,15 @@ def set_startup_enabled(enabled, target=None):
     elif link.exists() and is_startup_enabled(target):
         link.unlink()
     return is_startup_enabled(target)
+
+
+def refresh_startup_shortcut_if_needed():
+    if not is_startup_enabled():
+        return False
+    if shortcut_info(startup_link_path()).get("arguments", "") != startup_arguments():
+        set_startup_enabled(True)
+        return True
+    return False
 
 
 def migrate_legacy_data():
@@ -898,7 +935,10 @@ class App:
         self.beep_until = 0
         self.events = queue.Queue()
         self.profile = IntVar(value=self.current_profile)
-        self.startup_enabled = BooleanVar(value=is_startup_enabled())
+        startup_enabled = is_startup_enabled()
+        if startup_enabled:
+            refresh_startup_shortcut_if_needed()
+        self.startup_enabled = BooleanVar(value=startup_enabled)
         self.threshold = DoubleVar(value=0.90)
         self.scales = StringVar(value="1.0")
         self.interval_ms = IntVar(value=250)
@@ -2331,6 +2371,7 @@ def smoke_test():
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--start-minimized", action="store_true")
     args = parser.parse_args(argv)
     if args.smoke_test:
         smoke_test()
@@ -2353,6 +2394,10 @@ def main(argv=None):
     app.last_root_size = (max(1, root.winfo_width()), max(1, root.winfo_height()))
     app.apply_scale(force=True)
     root.update_idletasks()
+    if args.start_minimized:
+        app.ensure_tray_icon(show_errors=False)
+        root.mainloop()
+        return 0
     root.deiconify()
     root.lift()
     root.update_idletasks()
