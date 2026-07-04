@@ -43,9 +43,10 @@ class CoreTest(unittest.TestCase):
             scaled = appmod.cv2.resize(appmod.cv2.imread(str(path), appmod.cv2.IMREAD_GRAYSCALE), (52, 39), interpolation=appmod.cv2.INTER_AREA)
             frame = np.zeros((120, 160, 3), dtype=np.uint8)
             frame[50:89, 70:122] = appmod.cv2.cvtColor(scaled, appmod.cv2.COLOR_GRAY2RGB)
-            detector = Detector({"_base_dir": str(base), "targets": [{"name": "target", "kind": "template", "path": str(path), "threshold": 0.99, "scales": "1.0-1.5:0.1"}]})
+            detector = Detector({"_base_dir": str(base), "targets": [{"id": "target-id", "name": "target", "kind": "template", "path": str(path), "threshold": 0.99, "scales": "1.0-1.5:0.1"}]})
             matches = detector.run(frame)
             self.assertEqual(matches[0]["target"], "target")
+            self.assertEqual(matches[0]["target_id"], "target-id")
             self.assertEqual(matches[0]["box"], [70, 50, 122, 89])
             self.assertEqual(matches[0]["scale"], 1.3)
 
@@ -238,6 +239,15 @@ class CoreTest(unittest.TestCase):
             unregister.assert_called_once_with(thumb)
             self.assertEqual(app.dwm_thumbs, {})
 
+    def test_layout_drag_keeps_dwm_preview_live(self):
+        app = object.__new__(appmod.App)
+        app.layout_active_until = 0
+        app.ensure_dwm_sync_loop = mock.Mock()
+        app.suspend_dwm_previews = mock.Mock()
+        appmod.App.begin_layout_drag(app)
+        app.ensure_dwm_sync_loop.assert_called_once()
+        app.suspend_dwm_previews.assert_not_called()
+
     def test_hide_to_tray_unregisters_dwm_preview_before_withdraw(self):
         app = object.__new__(appmod.App)
         app.root = mock.Mock()
@@ -410,7 +420,7 @@ class CoreTest(unittest.TestCase):
             appmod.THUMBS_DIR = appmod.DATA_DIR / "thumbs"
             try:
                 targets = []
-                for name in ("1-1-old", "1-3-old"):
+                for name in ("1-1-old-a", "1-3-old-b"):
                     template = appmod.DATA_DIR / "templates" / f"{name}.png"
                     thumb = appmod.THUMBS_DIR / f"{name}.png"
                     template.parent.mkdir(parents=True, exist_ok=True)
@@ -420,9 +430,11 @@ class CoreTest(unittest.TestCase):
                     targets.append({"name": name, "path": str(template), "thumb": str(thumb)})
                 renamed, changed = normalize_target_names(targets, 1)
                 self.assertTrue(changed)
-                self.assertEqual([Path(t["path"]).stem for t in renamed], ["1-1-old", "1-2-old"])
+                self.assertEqual([Path(t["path"]).stem for t in renamed], ["1-1-old-a", "1-2-old-b"])
+                self.assertEqual([t["id"] for t in renamed], ["old-a", "old-b"])
+                self.assertEqual([t["hit_count"] for t in renamed], [0, 0])
                 self.assertTrue(Path(renamed[1]["thumb"]).exists())
-                self.assertFalse((appmod.DATA_DIR / "templates" / "1-3-old.png").exists())
+                self.assertFalse((appmod.DATA_DIR / "templates" / "1-3-old-b.png").exists())
             finally:
                 appmod.DATA_DIR, appmod.THUMBS_DIR = old_data, old_thumbs
 
@@ -577,6 +589,7 @@ class CoreTest(unittest.TestCase):
     def test_resize_ignores_window_moves_without_size_change(self):
         app = object.__new__(appmod.App)
         app.root = mock.Mock()
+        app.root.state.return_value = "normal"
         app.last_root_size = (980, 680)
         app.resize_job = None
         app.move_active_until = 0
@@ -588,10 +601,13 @@ class CoreTest(unittest.TestCase):
     def test_vertical_resize_does_not_reset_horizontal_panes(self):
         app = object.__new__(appmod.App)
         app.root = mock.Mock()
+        app.root.state.return_value = "normal"
         app.last_root_size = (980, 680)
         app.resize_job = None
+        app.ensure_dwm_sync_loop = mock.Mock()
         event = type("Event", (), {"widget": app.root, "width": 980, "height": 720})()
         appmod.App.on_resize(app, event)
+        app.ensure_dwm_sync_loop.assert_called_once()
 
         app.left_ratio = 0.5
         app.main_pane = mock.Mock()
@@ -600,6 +616,24 @@ class CoreTest(unittest.TestCase):
         appmod.App.restore_layout(app, horizontal=False)
         app.main_pane.sash_place.assert_not_called()
         app.left_pane.sash_place.assert_called_once_with(0, 0, 250)
+
+    def test_taskbar_minimize_configure_does_not_redraw_or_save_geometry(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.root.state.return_value = "iconic"
+        app.last_root_size = (1200, 700)
+        app.resize_job = "job"
+        app.resize_active_until = appmod.time.time() + 1
+        app.last_window_geometry = "1200x700+30+40"
+        app.ensure_dwm_sync_loop = mock.Mock()
+        event = type("Event", (), {"widget": app.root, "width": 160, "height": 28})()
+        appmod.App.on_resize(app, event)
+        app.root.after_cancel.assert_called_once_with("job")
+        app.root.after.assert_not_called()
+        app.ensure_dwm_sync_loop.assert_not_called()
+        self.assertIsNone(app.resize_job)
+        self.assertEqual(app.last_root_size, (1200, 700))
+        self.assertEqual(app.last_window_geometry, "1200x700+30+40")
 
     def test_restore_layout_waits_until_panes_are_mapped(self):
         app = object.__new__(appmod.App)
@@ -686,6 +720,14 @@ class CoreTest(unittest.TestCase):
                 self.assertEqual(data["layout"]["geometry"], "1400x900+120+80")
             finally:
                 appmod.STATE_PATH = old_state
+
+    def test_current_window_geometry_keeps_last_visible_geometry_when_iconic(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.root.state.return_value = "iconic"
+        app.root.geometry.return_value = "160x28+-32000+-32000"
+        app.last_window_geometry = "1200x700+30+40"
+        self.assertEqual(appmod.App.current_window_geometry(app), "1200x700+30+40")
 
     def test_autohide_scrollbar_only_maps_when_needed(self):
         root = appmod.Tk()
@@ -852,6 +894,27 @@ class CoreTest(unittest.TestCase):
         app.events.get_nowait.assert_not_called()
         app.root.after.assert_called_once_with(100, app.poll_events)
 
+    def test_poll_events_records_target_hit_counts(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.layout_busy = mock.Mock(return_value=False)
+        app.events = appmod.queue.Queue()
+        app.events.put(("target_hits", ["a", "b", "a"]))
+        app.targets = [{"id": "a", "hit_count": 2}, {"id": "b"}]
+        app.thumb_cache = {"old": object()}
+        app.reload_target_list = mock.Mock()
+        app.save_current_profile = mock.Mock()
+        app.status = mock.Mock()
+        app.log = mock.Mock()
+        appmod.App.poll_events(app)
+        self.assertEqual([target["hit_count"] for target in app.targets], [4, 1])
+        self.assertEqual(app.thumb_cache, {})
+        app.reload_target_list.assert_called_once()
+        app.save_current_profile.assert_called_once()
+        app.status.set.assert_not_called()
+        app.log.insert.assert_not_called()
+        app.root.after.assert_called_once_with(100, app.poll_events)
+
     def test_horizontal_resize_stretches_left_pane_only(self):
         root = appmod.Tk()
         root.geometry("1000x700")
@@ -949,6 +1012,17 @@ class CoreTest(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_window_map_resyncs_source_previews(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.root.state.return_value = "normal"
+        app.schedule_source_previews = mock.Mock()
+        app.ensure_dwm_sync_loop = mock.Mock()
+        event = type("Event", (), {"widget": app.root})()
+        appmod.App.on_window_mapped(app, event)
+        app.schedule_source_previews.assert_called_once_with(0)
+        app.ensure_dwm_sync_loop.assert_called_once()
+
     def test_single_instance_notification_wakes_existing_app(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
             probe.bind((appmod.INSTANCE_HOST, 0))
@@ -994,6 +1068,28 @@ class CoreTest(unittest.TestCase):
                 self.assertEqual(app.targets, [])
             finally:
                 appmod.DATA_DIR, appmod.THUMBS_DIR = old_data, old_thumbs
+
+    def test_record_target_hits_updates_matching_template_counts(self):
+        app = object.__new__(appmod.App)
+        app.targets = [
+            {"id": "a", "name": "1-1-a", "hit_count": 2},
+            {"id": "b", "name": "1-2-b", "hit_count": 0},
+        ]
+        app.thumb_cache = {"old": object()}
+        app.reload_target_list = mock.Mock()
+        app.save_current_profile = mock.Mock()
+        appmod.App.record_target_hits(app, ["a", "b", "a", "missing"])
+        self.assertEqual([target["hit_count"] for target in app.targets], [4, 1])
+        self.assertEqual(app.thumb_cache, {})
+        app.reload_target_list.assert_called_once()
+        app.save_current_profile.assert_called_once()
+
+    def test_count_badge_marks_thumbnail_top_right(self):
+        image = Image.new("RGB", (80, 50), (245, 245, 245))
+        app = object.__new__(appmod.App)
+        appmod.App.draw_count_badge(app, image, 12)
+        pixels = [image.getpixel((x, y)) for x in range(50, 78) for y in range(4, 22)]
+        self.assertTrue(any(pixel != (245, 245, 245) for pixel in pixels))
 
     def test_gallery_mousewheel_scrolls_canvas(self):
         app = object.__new__(appmod.App)
@@ -1121,10 +1217,12 @@ class CoreTest(unittest.TestCase):
                 Image.new("RGB", (12, 10), "red").save(one)
                 Image.new("RGB", (12, 10), "blue").save(two)
                 app.targets = [
-                    {"name": "one", "path": str(one), "enabled": True},
+                    {"id": "one-id", "name": "one", "path": str(one), "enabled": True},
                     {"name": "two", "path": str(two), "enabled": False},
                 ]
-                self.assertEqual([t["name"] for t in app.detector_config()["targets"]], ["one"])
+                config_targets = app.detector_config()["targets"]
+                self.assertEqual([t["name"] for t in config_targets], ["one"])
+                self.assertEqual([t["id"] for t in config_targets], ["one-id"])
                 app.targets[0]["enabled"] = False
                 with self.assertRaises(ValueError):
                     app.detector_config()

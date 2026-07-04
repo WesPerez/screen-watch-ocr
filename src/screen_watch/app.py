@@ -423,6 +423,33 @@ def template_suffix(name):
     return match.group(3) if match else template_stamp()
 
 
+def target_identity(target):
+    if target.get("id"):
+        return str(target["id"])
+    for key in ("path", "name"):
+        stem = Path(str(target.get(key, ""))).stem
+        match = TEMPLATE_NAME_RE.match(stem)
+        if match:
+            return match.group(3)
+    return str(target.get("name") or Path(str(target.get("path", "target"))).stem or template_stamp())
+
+
+def ensure_target_metadata(target):
+    updated = dict(target)
+    changed = False
+    if not updated.get("id"):
+        updated["id"] = target_identity(updated)
+        changed = True
+    try:
+        count = max(0, int(updated.get("hit_count", 0) or 0))
+    except (TypeError, ValueError):
+        count = 0
+    if updated.get("hit_count") != count:
+        updated["hit_count"] = count
+        changed = True
+    return updated, changed
+
+
 def available_template_name(profile, count, suffix, current_path=None, current_thumb=None):
     target_dir = DATA_DIR / "templates"
     current_path = Path(current_path).resolve() if current_path else None
@@ -487,9 +514,10 @@ def delete_target_files(target):
 
 
 def rename_target(target, profile, count):
+    target, metadata_changed = ensure_target_metadata(target)
     path = Path(target.get("path", ""))
     if not path.exists() or not is_under(path, DATA_DIR / "templates"):
-        return target, False
+        return target, metadata_changed
     old_name = target.get("name")
     thumb = Path(target.get("thumb", ""))
     old_path = path.resolve()
@@ -517,7 +545,7 @@ def rename_target(target, profile, count):
             target["thumb"] = str(save_thumb(image, new_path))
         changed = True
     target["name"] = stem
-    return target, changed or old_name != stem
+    return target, changed or old_name != stem or metadata_changed
 
 
 def normalize_target_names(targets, profile):
@@ -967,6 +995,7 @@ class App:
         self.root.bind_all("<Control-v>", self.handle_paste_hotkey)
         self.root.bind_all("<Control-V>", self.handle_paste_hotkey)
         self.root.bind("<Configure>", self.on_resize)
+        self.root.bind("<Map>", self.on_window_mapped)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         threading.Thread(target=self.run_preview_worker, daemon=True).start()
         self.root.after(250, self.restore_layout)
@@ -1229,7 +1258,7 @@ class App:
 
     def begin_layout_drag(self, _event=None):
         self.layout_active_until = time.time() + 0.8
-        self.suspend_dwm_previews()
+        self.ensure_dwm_sync_loop()
 
     def mark_layout_drag(self, _event=None):
         self.layout_active_until = time.time() + 0.8
@@ -1404,7 +1433,8 @@ class App:
         thumb = save_thumb(image, path)
         with Image.open(path) as saved:
             width, height = saved.size
-        self.targets.append({"name": path.stem, "path": str(path), "thumb": str(thumb), "size": f"{width}x{height}", "enabled": True})
+        target, _changed = ensure_target_metadata({"name": path.stem, "path": str(path), "thumb": str(thumb), "size": f"{width}x{height}", "enabled": True})
+        self.targets.append(target)
         self.selected_target = len(self.targets) - 1
         self.reload_target_list()
         self.save_current_profile()
@@ -1428,7 +1458,8 @@ class App:
     def make_thumb(self, target):
         path = target.get("thumb") or target["path"]
         mtime = Path(path).stat().st_mtime if Path(path).exists() else 0
-        key = (str(path), mtime, self.thumb_w, self.thumb_h)
+        hit_count = max(0, int(target.get("hit_count", 0) or 0))
+        key = (str(path), mtime, self.thumb_w, self.thumb_h, hit_count)
         if key in self.thumb_cache:
             return self.thumb_cache[key]
         with Image.open(path) as opened:
@@ -1436,8 +1467,30 @@ class App:
         img.thumbnail((self.thumb_w, self.thumb_h))
         canvas = Image.new("RGB", (self.thumb_w, self.thumb_h), (245, 245, 245))
         canvas.paste(img, ((self.thumb_w - img.width) // 2, (self.thumb_h - img.height) // 2))
+        if hit_count:
+            self.draw_count_badge(canvas, hit_count)
         self.thumb_cache[key] = ImageTk.PhotoImage(canvas)
         return self.thumb_cache[key]
+
+    def draw_count_badge(self, image, count):
+        draw = ImageDraw.Draw(image)
+        text = str(count)
+        try:
+            bbox = draw.textbbox((0, 0), text)
+            text_w, text_h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        except Exception:
+            text_w, text_h = draw.textsize(text)
+        pad_x, pad_y = 5, 2
+        width = max(18, text_w + pad_x * 2)
+        height = max(16, text_h + pad_y * 2)
+        x2 = image.width - 4
+        y1 = 4
+        box = (x2 - width, y1, x2, y1 + height)
+        try:
+            draw.rounded_rectangle(box, radius=7, fill=(220, 38, 38), outline=(255, 255, 255), width=1)
+        except Exception:
+            draw.rectangle(box, fill=(220, 38, 38), outline=(255, 255, 255))
+        draw.text((box[0] + (width - text_w) // 2, box[1] + (height - text_h) // 2 - 1), text, fill=(255, 255, 255))
 
     def select_target(self, index):
         old = getattr(self, "selected_target", None)
@@ -1870,7 +1923,7 @@ class App:
 
     def current_window_geometry(self):
         try:
-            if self.root.state() != "withdrawn":
+            if not self.window_hidden():
                 value = self.root.geometry()
                 if re.match(r"^\d+x\d+[+-]\d+[+-]\d+$", value):
                     self.last_window_geometry = value
@@ -1880,13 +1933,19 @@ class App:
 
     def remember_window_geometry(self, width=None, height=None):
         try:
-            if self.root.state() == "withdrawn":
+            if self.window_hidden():
                 return
             width = max(1, int(width or self.root.winfo_width()))
             height = max(1, int(height or self.root.winfo_height()))
             self.last_window_geometry = f"{width}x{height}+{self.root.winfo_x()}+{self.root.winfo_y()}"
         except Exception:
             pass
+
+    def window_hidden(self):
+        try:
+            return self.root.state() in {"withdrawn", "iconic"}
+        except Exception:
+            return False
 
     def capture_layout_ratios(self):
         try:
@@ -2138,17 +2197,32 @@ class App:
     def on_resize(self, event):
         if event.widget != self.root:
             return
+        if self.window_hidden():
+            if self.resize_job:
+                try:
+                    self.root.after_cancel(self.resize_job)
+                except TclError:
+                    pass
+                self.resize_job = None
+            self.resize_active_until = 0
+            return
         size = (event.width, event.height)
         self.remember_window_geometry(event.width, event.height)
         if size == self.last_root_size:
             self.move_active_until = time.time() + 0.3
             return
-        self.suspend_dwm_previews()
+        self.ensure_dwm_sync_loop()
         self.last_root_size = size
         self.resize_active_until = time.time() + 0.3
         if self.resize_job:
             self.root.after_cancel(self.resize_job)
         self.resize_job = self.root.after(120, self.apply_scale)
+
+    def on_window_mapped(self, event):
+        if event.widget != self.root or self.window_hidden():
+            return
+        self.schedule_source_previews(0)
+        self.ensure_dwm_sync_loop()
 
     def apply_scale(self, force=False):
         self.resize_job = None
@@ -2213,7 +2287,7 @@ class App:
             "windows": windows,
             "window_apps": self.selected_apps,
             "targets": [
-                {"name": t["name"], "kind": "template", "path": t["path"], "threshold": threshold, "scales": scales}
+                {"id": target_identity(t), "name": t["name"], "kind": "template", "path": t["path"], "threshold": threshold, "scales": scales}
                 for t in targets
             ],
             "cooldown_seconds": float(self.cooldown.get()),
@@ -2319,6 +2393,7 @@ class App:
                 kept.append(match)
         if not kept:
             return 0
+        self.events.put(("target_hits", [match.get("target_id", match["target"]) for match in kept]))
         alert_dir = ALERTS_DIR if config["alarm"]["save_dir"] == "screenshots" else DATA_DIR / config["alarm"]["save_dir"]
         stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000_000:09d}"
         image_path = alert_dir / f"{stamp}-{region['name']}.png"
@@ -2356,6 +2431,9 @@ class App:
                 kind, message = self.events.get_nowait()
             except queue.Empty:
                 break
+            if kind == "target_hits":
+                self.record_target_hits(message)
+                continue
             self.status.set(message)
             if kind == "stopped":
                 self.worker = None
@@ -2364,6 +2442,24 @@ class App:
             for item in self.log.get_children()[100:]:
                 self.log.delete(item)
         self.root.after(100, self.poll_events)
+
+    def record_target_hits(self, target_ids):
+        counts = {}
+        for item in target_ids:
+            key = str(item)
+            counts[key] = counts.get(key, 0) + 1
+        if not counts:
+            return
+        changed = False
+        for target in self.targets:
+            key = target_identity(target)
+            if key in counts:
+                target["hit_count"] = max(0, int(target.get("hit_count", 0) or 0)) + counts[key]
+                changed = True
+        if changed:
+            self.thumb_cache.clear()
+            self.reload_target_list()
+            self.save_current_profile()
 
     def open_evidence(self):
         path = ALERTS_DIR
