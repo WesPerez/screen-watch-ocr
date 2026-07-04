@@ -17,7 +17,7 @@ import wave
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from tkinter import BooleanVar, Canvas, DoubleVar, Frame, IntVar, Label, PanedWindow, StringVar, Tk, Toplevel, filedialog, messagebox, ttk
+from tkinter import BooleanVar, Canvas, DoubleVar, Frame, IntVar, Label, Menu, PanedWindow, StringVar, Tk, Toplevel, filedialog, messagebox, ttk
 from tkinter import TclError
 import tkinter.font as tkfont
 from ctypes import wintypes
@@ -1674,6 +1674,17 @@ class App:
                 self.status.set("已清空该图片的命中次数。")
         return "break"
 
+    def show_target_context_menu(self, event, index):
+        if index < 0 or index >= len(self.targets):
+            return "break"
+        menu = Menu(self.root, tearoff=False)
+        menu.add_command(label="清空命中次数", command=lambda i=index: self.clear_target_hit_count(i))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
     def selected_windows(self):
         out = []
         for app in self.selected_apps:
@@ -2038,7 +2049,7 @@ class App:
                 widget.bind("<ButtonPress-1>", lambda event, i=idx: self.begin_target_drag(event, i))
                 widget.bind("<B1-Motion>", self.update_target_drag)
                 widget.bind("<ButtonRelease-1>", self.end_target_drag)
-                widget.bind("<Button-3>", lambda event, i=idx: self.clear_target_hit_count(i))
+                widget.bind("<Button-3>", lambda event, i=idx: self.show_target_context_menu(event, i))
             for widget in (card, check, image, text):
                 widget.bind("<MouseWheel>", self.scroll_targets)
         self.target_canvas.configure(height=max(150, int((self.thumb_h + 34) * 2)))

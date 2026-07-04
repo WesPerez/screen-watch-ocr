@@ -977,6 +977,24 @@ class CoreTest(unittest.TestCase):
         app.save_current_profile.assert_called_once()
         app.status.set.assert_called_once_with("已清空该图片的命中次数。")
 
+    def test_target_right_click_opens_hit_count_menu(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.targets = [{"id": "a", "hit_count": 7}]
+        app.clear_target_hit_count = mock.Mock(return_value="break")
+        event = type("Event", (), {"x_root": 10, "y_root": 20})()
+        menu = mock.Mock()
+        with mock.patch.object(appmod, "Menu", return_value=menu) as menu_class:
+            self.assertEqual(appmod.App.show_target_context_menu(app, event, 0), "break")
+        menu_class.assert_called_once_with(app.root, tearoff=False)
+        command = menu.add_command.call_args.kwargs["command"]
+        self.assertEqual(menu.add_command.call_args.kwargs["label"], "清空命中次数")
+        app.clear_target_hit_count.assert_not_called()
+        menu.tk_popup.assert_called_once_with(10, 20)
+        menu.grab_release.assert_called_once()
+        command()
+        app.clear_target_hit_count.assert_called_once_with(0)
+
     def test_horizontal_resize_stretches_left_pane_only(self):
         root = appmod.Tk()
         root.geometry("1000x700")
