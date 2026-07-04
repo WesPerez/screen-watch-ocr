@@ -277,7 +277,9 @@ class CoreTest(unittest.TestCase):
         app.ensure_tray_icon = mock.Mock(return_value=True)
         app.disable_source_previews = mock.Mock()
         app.status = mock.Mock()
+        app.hide_to_tray_pending = False
         appmod.App.hide_to_tray(app)
+        self.assertTrue(app.hide_to_tray_pending)
         app.disable_source_previews.assert_called_once()
         app.root.withdraw.assert_called_once()
 
@@ -288,7 +290,9 @@ class CoreTest(unittest.TestCase):
         app.disable_source_previews = mock.Mock()
         app.enable_source_previews = mock.Mock()
         app.status = mock.Mock()
+        app.hide_to_tray_pending = False
         appmod.App.hide_to_tray(app)
+        self.assertFalse(app.hide_to_tray_pending)
         app.enable_source_previews.assert_called_once_with(250)
         app.status.set.assert_not_called()
 
@@ -1039,13 +1043,58 @@ class CoreTest(unittest.TestCase):
         finally:
             root.destroy()
 
-    def test_window_unmap_suspends_dwm_preview(self):
+    def test_window_unmap_covers_dynamic_canvases_before_taskbar_restore(self):
         app = object.__new__(appmod.App)
         app.root = mock.Mock()
+        app.hide_to_tray_pending = False
+        app.show_restore_overlays = mock.Mock()
         app.suspend_dwm_previews = mock.Mock()
         event = type("Event", (), {"widget": app.root})()
         appmod.App.on_window_unmapped(app, event)
+        app.show_restore_overlays.assert_called_once()
         app.suspend_dwm_previews.assert_called_once()
+
+    def test_window_unmap_from_tray_does_not_cover_dynamic_canvases(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.hide_to_tray_pending = True
+        app.clear_restore_overlays = mock.Mock()
+        app.show_restore_overlays = mock.Mock()
+        app.suspend_dwm_previews = mock.Mock()
+        event = type("Event", (), {"widget": app.root})()
+        appmod.App.on_window_unmapped(app, event)
+        self.assertFalse(app.hide_to_tray_pending)
+        app.clear_restore_overlays.assert_called_once()
+        app.show_restore_overlays.assert_not_called()
+        app.suspend_dwm_previews.assert_called_once()
+
+    def test_restore_overlay_covers_black_canvas_with_window_background(self):
+        root = appmod.Tk()
+        try:
+            root.withdraw()
+            app = object.__new__(appmod.App)
+            app.root = root
+            app.restore_overlay_items = []
+            app.target_canvas = appmod.Canvas(root, bg="#000000", width=120, height=80)
+            app.target_canvas.pack()
+            app.right_canvas = None
+            app.source_canvas = None
+            appmod.App.show_restore_overlays(app)
+            self.assertEqual(len(app.restore_overlay_items), 1)
+            overlay = app.restore_overlay_items[0]
+            self.assertEqual(overlay.cget("bg"), root.cget("bg"))
+            self.assertEqual(overlay.winfo_manager(), "place")
+        finally:
+            root.destroy()
+
+    def test_window_map_clears_restore_overlay_after_tk_repaints(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.restore_overlay_items = [mock.Mock()]
+        app.clear_restore_overlays = mock.Mock()
+        event = type("Event", (), {"widget": app.root})()
+        appmod.App.on_window_mapped(app, event)
+        app.root.after.assert_called_once_with(appmod.RESTORE_OVERLAY_CLEAR_MS, app.clear_restore_overlays)
 
     def test_single_instance_notification_wakes_existing_app(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:

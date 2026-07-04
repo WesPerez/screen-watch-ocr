@@ -70,6 +70,7 @@ PREVIEW_H = 200
 SCREEN_PREVIEW_SECONDS = 0.25
 SOURCE_PREVIEW_SYNC_MS = 250
 DWM_PREVIEW_SYNC_MS = 33
+RESTORE_OVERLAY_CLEAR_MS = SOURCE_PREVIEW_SYNC_MS * 2
 MIN_SCAN_INTERVAL_MS = 120
 VK_LBUTTON = 0x01
 INSTANCE_HOST = "127.0.0.1"
@@ -955,6 +956,8 @@ class App:
         self.preview_job = None
         self.source_previews_enabled = False
         self.dwm_sync_job = None
+        self.hide_to_tray_pending = False
+        self.restore_overlay_items = []
         self.worker = None
         self.tray_icon = None
         self.stop_event = threading.Event()
@@ -995,6 +998,7 @@ class App:
         self.root.bind_all("<Control-v>", self.handle_paste_hotkey)
         self.root.bind_all("<Control-V>", self.handle_paste_hotkey)
         self.root.bind("<Configure>", self.on_resize)
+        self.root.bind("<Map>", self.on_window_mapped)
         self.root.bind("<Unmap>", self.on_window_unmapped)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         threading.Thread(target=self.run_preview_worker, daemon=True).start()
@@ -1735,6 +1739,31 @@ class App:
             self.preview_job = None
         self.suspend_dwm_previews()
 
+    def show_restore_overlays(self):
+        self.clear_restore_overlays()
+        try:
+            bg = self.root.cget("bg")
+        except TclError:
+            bg = "SystemButtonFace"
+        for canvas in (getattr(self, "target_canvas", None), getattr(self, "right_canvas", None), getattr(self, "source_canvas", None)):
+            if not canvas:
+                continue
+            try:
+                overlay = Frame(canvas, bg=bg, bd=0, highlightthickness=0)
+                overlay.place(x=0, y=0, relwidth=1, relheight=1)
+                overlay.lift()
+                self.restore_overlay_items.append(overlay)
+            except TclError:
+                pass
+
+    def clear_restore_overlays(self):
+        for overlay in getattr(self, "restore_overlay_items", []):
+            try:
+                overlay.destroy()
+            except TclError:
+                pass
+        self.restore_overlay_items = []
+
     def visible_preview_rect(self, widget):
         try:
             if self.root.state() in {"withdrawn", "iconic"} or not widget.winfo_viewable():
@@ -2120,9 +2149,11 @@ class App:
         return img
 
     def hide_to_tray(self):
+        self.hide_to_tray_pending = True
         self.disable_source_previews()
         self.root.withdraw()
         if not self.ensure_tray_icon(show_errors=True):
+            self.hide_to_tray_pending = False
             self.enable_source_previews(250)
             return
         self.status.set("已缩小到系统托盘。")
@@ -2150,6 +2181,8 @@ class App:
 
     def show_window(self):
         self.ensure_tray_icon(show_errors=False)
+        self.hide_to_tray_pending = False
+        self.clear_restore_overlays()
         self.disable_source_previews()
         self.root.deiconify()
         self.root.lift()
@@ -2228,7 +2261,21 @@ class App:
     def on_window_unmapped(self, event):
         if event.widget != self.root:
             return
+        if getattr(self, "hide_to_tray_pending", False):
+            self.hide_to_tray_pending = False
+            self.clear_restore_overlays()
+            self.suspend_dwm_previews()
+            return
+        self.show_restore_overlays()
         self.suspend_dwm_previews()
+
+    def on_window_mapped(self, event):
+        if event.widget != self.root or not getattr(self, "restore_overlay_items", None):
+            return
+        try:
+            self.root.after(RESTORE_OVERLAY_CLEAR_MS, self.clear_restore_overlays)
+        except TclError:
+            self.clear_restore_overlays()
 
     def apply_scale(self, force=False):
         self.resize_job = None
