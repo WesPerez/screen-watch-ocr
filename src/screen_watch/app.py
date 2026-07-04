@@ -2021,13 +2021,14 @@ class App:
         for idx, target in enumerate(self.targets):
             row, col = divmod(idx, columns)
             bg = "#dbeafe" if idx == self.selected_target else "#ffffff"
+            text_h = max(16, int(16 * self.last_scale))
             card = Frame(
                 self.gallery_inner,
                 bd=1,
                 relief="solid",
                 bg=bg,
                 width=self.thumb_w + 12,
-                height=self.thumb_h + max(24, int(22 * self.last_scale)),
+                height=self.thumb_h + text_h + 14,
             )
             card.grid(row=row, column=col, padx=6, pady=6, sticky="n")
             card.grid_propagate(False)
@@ -2035,14 +2036,14 @@ class App:
             self.target_vars.append(enabled_var)
             thumb = self.make_thumb(target)
             self.thumb_refs.append(thumb)
-            image = Label(card, image=thumb, bg=bg, width=self.thumb_w, height=self.thumb_h, bd=1, relief="solid")
+            image = Label(card, image=thumb, bg=bg, width=self.thumb_w, height=self.thumb_h)
             image.place(x=6, y=6, width=self.thumb_w, height=self.thumb_h)
             check = ttk.Checkbutton(card, variable=enabled_var, command=lambda i=idx, v=enabled_var: self.toggle_target(i, v))
             check.place(x=7, y=7, width=18, height=18)
             filename = self.one_line_name(Path(target["path"]).name, self.thumb_w)
             text_font = getattr(self, "target_name_font", self.fonts.get("TkDefaultFont"))
             text = Label(card, text=filename, bg=bg, anchor="center", font=text_font)
-            text.place(x=4, y=self.thumb_h + 8, width=self.thumb_w + 4, height=max(16, int(16 * self.last_scale)))
+            text.place(x=4, y=self.thumb_h + 8, width=self.thumb_w + 4, height=text_h)
             self.target_cards[idx] = (card, image, text)
             for widget in (card, image, text):
                 widget.bind("<ButtonPress-1>", lambda event, i=idx: self.begin_target_drag(event, i))

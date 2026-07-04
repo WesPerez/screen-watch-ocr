@@ -1277,7 +1277,7 @@ class CoreTest(unittest.TestCase):
         pixels = [image.getpixel((x, y)) for x in range(50, 78) for y in range(4, 22)]
         self.assertTrue(any(pixel != (245, 245, 245) for pixel in pixels))
 
-    def test_target_thumbnail_area_has_border(self):
+    def test_target_card_keeps_bottom_border_visible(self):
         root = appmod.Tk()
         root.withdraw()
         try:
@@ -1299,9 +1299,11 @@ class CoreTest(unittest.TestCase):
                 app.target_canvas = mock.Mock()
                 app.status = mock.Mock()
                 appmod.App.reload_target_list(app)
-                _card, image_label, _text = app.target_cards[0]
-                self.assertEqual(image_label.cget("relief"), "solid")
-                self.assertEqual(int(image_label.cget("bd")), 1)
+                card, image_label, text = app.target_cards[0]
+                text_place = text.place_info()
+                text_bottom = int(text_place["y"]) + int(text_place["height"])
+                self.assertEqual(image_label.cget("relief"), "flat")
+                self.assertGreaterEqual(int(card.cget("height")) - text_bottom, 4)
         finally:
             root.destroy()
 
