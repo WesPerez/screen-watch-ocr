@@ -1048,11 +1048,11 @@ class CoreTest(unittest.TestCase):
         app.root = mock.Mock()
         app.hide_to_tray_pending = False
         app.show_restore_overlays = mock.Mock()
-        app.suspend_dwm_previews = mock.Mock()
+        app.disable_source_previews = mock.Mock()
         event = type("Event", (), {"widget": app.root})()
         appmod.App.on_window_unmapped(app, event)
         app.show_restore_overlays.assert_called_once()
-        app.suspend_dwm_previews.assert_called_once()
+        app.disable_source_previews.assert_called_once()
 
     def test_window_unmap_from_tray_does_not_cover_dynamic_canvases(self):
         app = object.__new__(appmod.App)
@@ -1091,9 +1091,11 @@ class CoreTest(unittest.TestCase):
         app = object.__new__(appmod.App)
         app.root = mock.Mock()
         app.restore_overlay_items = [mock.Mock()]
+        app.enable_source_previews = mock.Mock()
         app.clear_restore_overlays = mock.Mock()
         event = type("Event", (), {"widget": app.root})()
         appmod.App.on_window_mapped(app, event)
+        app.enable_source_previews.assert_called_once_with(0)
         app.root.after.assert_called_once_with(appmod.RESTORE_OVERLAY_CLEAR_MS, app.clear_restore_overlays)
 
     def test_single_instance_notification_wakes_existing_app(self):

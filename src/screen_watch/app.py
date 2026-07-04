@@ -70,7 +70,7 @@ PREVIEW_H = 200
 SCREEN_PREVIEW_SECONDS = 0.25
 SOURCE_PREVIEW_SYNC_MS = 250
 DWM_PREVIEW_SYNC_MS = 33
-RESTORE_OVERLAY_CLEAR_MS = SOURCE_PREVIEW_SYNC_MS * 2
+RESTORE_OVERLAY_CLEAR_MS = 120
 MIN_SCAN_INTERVAL_MS = 120
 VK_LBUTTON = 0x01
 INSTANCE_HOST = "127.0.0.1"
@@ -2267,12 +2267,13 @@ class App:
             self.suspend_dwm_previews()
             return
         self.show_restore_overlays()
-        self.suspend_dwm_previews()
+        self.disable_source_previews()
 
     def on_window_mapped(self, event):
         if event.widget != self.root or not getattr(self, "restore_overlay_items", None):
             return
         try:
+            self.enable_source_previews(0)
             self.root.after(RESTORE_OVERLAY_CLEAR_MS, self.clear_restore_overlays)
         except TclError:
             self.clear_restore_overlays()
