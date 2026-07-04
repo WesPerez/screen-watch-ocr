@@ -1122,7 +1122,6 @@ class App:
         ttk.Button(actions, text="扫描一次", command=self.scan_once).pack(fill="x", padx=8, pady=4)
         ttk.Button(actions, text="打开证据目录", command=self.open_evidence).pack(fill="x", padx=8, pady=(4, 8))
 
-        ttk.Label(right, textvariable=self.status, wraplength=300).pack(fill="x", pady=8)
         self.bind_mousewheel(right, self.scroll_right)
 
     def make_entry(self, parent, var):
