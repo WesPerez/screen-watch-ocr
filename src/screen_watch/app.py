@@ -1396,16 +1396,28 @@ class App:
 
     def capture_as_target(self):
         try:
-            monitor = next(i for i, var in self.monitor_vars.items() if var.get())
             from mss import mss
 
             with mss() as sct:
-                monitors = [{"index": i, **m} for i, m in enumerate(sct.monitors)]
-                region = config_regions({"regions": [self.region_for(monitor)]}, monitors)[0]
-                frame = capture_region(sct, region)
-            self.add_image(f"capture-monitor-{monitor}", Image.fromarray(frame))
+                name, frame = self.capture_target_frame(sct)
+            self.add_image(name, Image.fromarray(frame))
         except Exception as exc:
             messagebox.showerror("截图失败", str(exc))
+
+    def capture_target_frame(self, sct):
+        for monitor, var in self.monitor_vars.items():
+            if var.get():
+                monitors = [{"index": i, **m} for i, m in enumerate(sct.monitors)]
+                region = config_regions({"regions": [self.region_for(monitor)]}, monitors)[0]
+                return f"capture-monitor-{monitor}", capture_region(sct, region)
+        windows = self.selected_windows()
+        for window in windows:
+            frame = capture_window_preview(sct, window["hwnd"])
+            if frame is not None and not mostly_black(frame):
+                return f"capture-{safe_name(window.get('display') or window['name'])}", frame
+        if windows:
+            raise ValueError("应用窗口截图为空或黑屏，请把窗口露出后重试。")
+        raise ValueError("当前没有可截图来源，请先勾选一个屏幕或选择一个已启动的应用。")
 
     def add_image(self, name, image):
         max_templates = parse_positive_int(self.max_templates.get(), "max_templates")
@@ -1645,6 +1657,22 @@ class App:
         self.selected_target = None
         self.reload_target_list()
         self.save_current_profile()
+
+    def clear_target_hit_count(self, index):
+        if index < 0 or index >= len(self.targets):
+            return "break"
+        self.selected_target = index
+        target = self.targets[index]
+        count = max(0, int(target.get("hit_count", 0) or 0))
+        if count:
+            target["hit_count"] = 0
+            self.thumb_cache.clear()
+        self.reload_target_list()
+        if count:
+            self.save_current_profile()
+            if hasattr(self, "status"):
+                self.status.set("已清空该图片的命中次数。")
+        return "break"
 
     def selected_windows(self):
         out = []
@@ -2010,6 +2038,7 @@ class App:
                 widget.bind("<ButtonPress-1>", lambda event, i=idx: self.begin_target_drag(event, i))
                 widget.bind("<B1-Motion>", self.update_target_drag)
                 widget.bind("<ButtonRelease-1>", self.end_target_drag)
+                widget.bind("<Button-3>", lambda event, i=idx: self.clear_target_hit_count(i))
             for widget in (card, check, image, text):
                 widget.bind("<MouseWheel>", self.scroll_targets)
         self.target_canvas.configure(height=max(150, int((self.thumb_h + 34) * 2)))

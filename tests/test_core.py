@@ -937,6 +937,46 @@ class CoreTest(unittest.TestCase):
         app.log.insert.assert_not_called()
         app.root.after.assert_called_once_with(100, app.poll_events)
 
+    def test_capture_target_frame_uses_selected_window_without_monitor(self):
+        import numpy as np
+
+        app = object.__new__(appmod.App)
+        app.monitor_vars = {}
+        app.selected_apps = [{"title": "Demo", "ordinal": 1}]
+        key = window_key("Demo", 1)
+        app.window_info = {key: {"title": "Demo", "display": "Demo", "hwnd": 123, "key": key, "width": 120, "height": 80}}
+        frame = np.full((4, 5, 3), 64, dtype=np.uint8)
+        sct = object()
+        with mock.patch.object(appmod, "capture_window_preview", return_value=frame) as capture:
+            name, out = appmod.App.capture_target_frame(app, sct)
+        self.assertEqual(name, "capture-Demo")
+        self.assertIs(out, frame)
+        capture.assert_called_once_with(sct, 123)
+
+    def test_capture_target_frame_reports_missing_source(self):
+        app = object.__new__(appmod.App)
+        app.monitor_vars = {}
+        app.selected_apps = []
+        app.window_info = {}
+        with self.assertRaisesRegex(ValueError, "当前没有可截图来源"):
+            appmod.App.capture_target_frame(app, object())
+
+    def test_clear_target_hit_count_resets_badge_count(self):
+        app = object.__new__(appmod.App)
+        app.targets = [{"id": "a", "hit_count": 7}, {"id": "b", "hit_count": 2}]
+        app.selected_target = None
+        app.thumb_cache = {"old": object()}
+        app.reload_target_list = mock.Mock()
+        app.save_current_profile = mock.Mock()
+        app.status = mock.Mock()
+        self.assertEqual(appmod.App.clear_target_hit_count(app, 1), "break")
+        self.assertEqual([target["hit_count"] for target in app.targets], [7, 0])
+        self.assertEqual(app.selected_target, 1)
+        self.assertEqual(app.thumb_cache, {})
+        app.reload_target_list.assert_called_once()
+        app.save_current_profile.assert_called_once()
+        app.status.set.assert_called_once_with("已清空该图片的命中次数。")
+
     def test_horizontal_resize_stretches_left_pane_only(self):
         root = appmod.Tk()
         root.geometry("1000x700")
