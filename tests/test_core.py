@@ -234,19 +234,42 @@ class CoreTest(unittest.TestCase):
         app = object.__new__(appmod.App)
         thumb = object()
         app.dwm_thumbs = {"app:x": {"thumb": thumb, "hwnd": 222, "rect": (1, 2, 3, 4)}}
+        app.dwm_sync_job = None
+        app.source_widgets = {}
         with mock.patch.object(appmod, "dwm_unregister") as unregister:
             appmod.App.suspend_dwm_previews(app)
             unregister.assert_called_once_with(thumb)
             self.assertEqual(app.dwm_thumbs, {})
 
-    def test_layout_drag_keeps_dwm_preview_live(self):
+    def test_suspend_dwm_preview_restores_fallback_before_unregistering(self):
+        app = object.__new__(appmod.App)
+        thumb = object()
+        image = mock.Mock()
+        image.image = None
+        area = mock.Mock()
+        area.winfo_width.return_value = 300
+        area.winfo_height.return_value = 180
+        app.dwm_thumbs = {"app:x": {"thumb": thumb, "hwnd": 222, "rect": (1, 2, 3, 4)}}
+        app.dwm_sync_job = "job"
+        app.root = mock.Mock()
+        app.source_widgets = {"app:x": {"area": area, "image": image}}
+        app.placeholder_image = mock.Mock(return_value="photo")
+        with mock.patch.object(appmod, "dwm_unregister") as unregister:
+            appmod.App.suspend_dwm_previews(app)
+            app.root.after_cancel.assert_called_once_with("job")
+            image.place.assert_called_once_with(x=0, y=0, width=300, height=180)
+            image.configure.assert_called_once_with(image="photo")
+            self.assertEqual(image.image, "photo")
+            unregister.assert_called_once_with(thumb)
+
+    def test_layout_drag_suspends_dwm_preview(self):
         app = object.__new__(appmod.App)
         app.layout_active_until = 0
         app.ensure_dwm_sync_loop = mock.Mock()
         app.suspend_dwm_previews = mock.Mock()
         appmod.App.begin_layout_drag(app)
-        app.ensure_dwm_sync_loop.assert_called_once()
-        app.suspend_dwm_previews.assert_not_called()
+        app.ensure_dwm_sync_loop.assert_not_called()
+        app.suspend_dwm_previews.assert_called_once()
 
     def test_hide_to_tray_unregisters_dwm_preview_before_withdraw(self):
         app = object.__new__(appmod.App)
@@ -605,9 +628,11 @@ class CoreTest(unittest.TestCase):
         app.last_root_size = (980, 680)
         app.resize_job = None
         app.ensure_dwm_sync_loop = mock.Mock()
+        app.suspend_dwm_previews = mock.Mock()
         event = type("Event", (), {"widget": app.root, "width": 980, "height": 720})()
         appmod.App.on_resize(app, event)
-        app.ensure_dwm_sync_loop.assert_called_once()
+        app.ensure_dwm_sync_loop.assert_not_called()
+        app.suspend_dwm_previews.assert_called_once()
 
         app.left_ratio = 0.5
         app.main_pane = mock.Mock()
@@ -626,11 +651,13 @@ class CoreTest(unittest.TestCase):
         app.resize_active_until = appmod.time.time() + 1
         app.last_window_geometry = "1200x700+30+40"
         app.ensure_dwm_sync_loop = mock.Mock()
+        app.suspend_dwm_previews = mock.Mock()
         event = type("Event", (), {"widget": app.root, "width": 160, "height": 28})()
         appmod.App.on_resize(app, event)
         app.root.after_cancel.assert_called_once_with("job")
         app.root.after.assert_not_called()
         app.ensure_dwm_sync_loop.assert_not_called()
+        app.suspend_dwm_previews.assert_not_called()
         self.assertIsNone(app.resize_job)
         self.assertEqual(app.last_root_size, (1200, 700))
         self.assertEqual(app.last_window_geometry, "1200x700+30+40")
@@ -1012,16 +1039,13 @@ class CoreTest(unittest.TestCase):
         finally:
             root.destroy()
 
-    def test_window_map_resyncs_source_previews(self):
+    def test_window_unmap_suspends_dwm_preview(self):
         app = object.__new__(appmod.App)
         app.root = mock.Mock()
-        app.root.state.return_value = "normal"
-        app.schedule_source_previews = mock.Mock()
-        app.ensure_dwm_sync_loop = mock.Mock()
+        app.suspend_dwm_previews = mock.Mock()
         event = type("Event", (), {"widget": app.root})()
-        appmod.App.on_window_mapped(app, event)
-        app.schedule_source_previews.assert_called_once_with(0)
-        app.ensure_dwm_sync_loop.assert_called_once()
+        appmod.App.on_window_unmapped(app, event)
+        app.suspend_dwm_previews.assert_called_once()
 
     def test_single_instance_notification_wakes_existing_app(self):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:

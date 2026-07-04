@@ -995,7 +995,7 @@ class App:
         self.root.bind_all("<Control-v>", self.handle_paste_hotkey)
         self.root.bind_all("<Control-V>", self.handle_paste_hotkey)
         self.root.bind("<Configure>", self.on_resize)
-        self.root.bind("<Map>", self.on_window_mapped)
+        self.root.bind("<Unmap>", self.on_window_unmapped)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         threading.Thread(target=self.run_preview_worker, daemon=True).start()
         self.root.after(250, self.restore_layout)
@@ -1258,7 +1258,7 @@ class App:
 
     def begin_layout_drag(self, _event=None):
         self.layout_active_until = time.time() + 0.8
-        self.ensure_dwm_sync_loop()
+        self.suspend_dwm_previews()
 
     def mark_layout_drag(self, _event=None):
         self.layout_active_until = time.time() + 0.8
@@ -1696,8 +1696,35 @@ class App:
         if record:
             dwm_unregister(record["thumb"])
 
+    def show_preview_fallback(self, key):
+        widgets = getattr(self, "source_widgets", {}).get(key)
+        if not widgets:
+            return
+        try:
+            area = widgets["area"]
+            image = widgets["image"]
+            width = max(1, area.winfo_width() or PREVIEW_W)
+            height = max(1, area.winfo_height() or PREVIEW_H)
+            image.place(x=0, y=0, width=width, height=height)
+            if getattr(image, "image", None) and widgets.get("photo_size") == (width, height):
+                return
+            photo = self.placeholder_image("等待画面", width, height)
+            image.configure(image=photo)
+            image.image = photo
+            widgets["photo_frame_id"] = None
+            widgets["photo_size"] = (width, height)
+        except Exception:
+            pass
+
     def suspend_dwm_previews(self):
+        if getattr(self, "dwm_sync_job", None):
+            try:
+                self.root.after_cancel(self.dwm_sync_job)
+            except TclError:
+                pass
+            self.dwm_sync_job = None
         for key in list(getattr(self, "dwm_thumbs", {})):
+            self.show_preview_fallback(key)
             self.unregister_dwm_preview(key)
 
     def schedule_source_previews(self, delay):
@@ -2211,18 +2238,17 @@ class App:
         if size == self.last_root_size:
             self.move_active_until = time.time() + 0.3
             return
-        self.ensure_dwm_sync_loop()
+        self.suspend_dwm_previews()
         self.last_root_size = size
         self.resize_active_until = time.time() + 0.3
         if self.resize_job:
             self.root.after_cancel(self.resize_job)
         self.resize_job = self.root.after(120, self.apply_scale)
 
-    def on_window_mapped(self, event):
-        if event.widget != self.root or self.window_hidden():
+    def on_window_unmapped(self, event):
+        if event.widget != self.root:
             return
-        self.schedule_source_previews(0)
-        self.ensure_dwm_sync_loop()
+        self.suspend_dwm_previews()
 
     def apply_scale(self, force=False):
         self.resize_job = None
