@@ -460,7 +460,8 @@ class CoreTest(unittest.TestCase):
                 self.assertEqual([Path(t["path"]).stem for t in renamed], ["1-1-old-a", "1-2-old-b"])
                 self.assertEqual([t["id"] for t in renamed], ["old-a", "old-b"])
                 self.assertEqual([t["hit_count"] for t in renamed], [0, 0])
-                self.assertTrue(Path(renamed[1]["thumb"]).exists())
+                self.assertNotIn("thumb", renamed[1])
+                self.assertTrue((appmod.THUMBS_DIR / "1-3-old-b.png").exists())
                 self.assertFalse((appmod.DATA_DIR / "templates" / "1-3-old-b.png").exists())
             finally:
                 appmod.DATA_DIR, appmod.THUMBS_DIR = old_data, old_thumbs
@@ -486,6 +487,7 @@ class CoreTest(unittest.TestCase):
                 self.assertTrue(normalize_profile_file(1))
                 data = appmod.load_json(appmod.PROFILES_DIR / "profile_1.json", {})
                 self.assertEqual([Path(t["path"]).stem for t in data["targets"]], ["1-1-old", "1-2-old"])
+                self.assertNotIn("thumb", data["targets"][0])
             finally:
                 appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.THUMBS_DIR = old_data, old_profiles, old_thumbs
 
@@ -1144,6 +1146,74 @@ class CoreTest(unittest.TestCase):
             finally:
                 appmod.DATA_DIR, appmod.THUMBS_DIR = old_data, old_thumbs
 
+    def test_reorder_target_renames_files_by_new_position(self):
+        old_data, old_thumbs = appmod.DATA_DIR, appmod.THUMBS_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            appmod.DATA_DIR = base / "data"
+            appmod.THUMBS_DIR = appmod.DATA_DIR / "thumbs"
+            try:
+                app = object.__new__(appmod.App)
+                app.current_profile = 1
+                app.thumb_cache = {"old": object()}
+                app.reload_target_list = mock.Mock()
+                app.save_current_profile = mock.Mock()
+                app.status = mock.Mock()
+                app.targets = []
+                for stem in ("1-1-a", "1-2-b", "1-3-c"):
+                    path = appmod.DATA_DIR / "templates" / f"{stem}.png"
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    Image.new("RGB", (4, 4), "red").save(path)
+                    app.targets.append({"id": stem.rsplit("-", 1)[-1], "name": stem, "path": str(path), "thumb": str(appmod.THUMBS_DIR / f"{stem}.png")})
+                self.assertTrue(appmod.App.reorder_target(app, 0, len(app.targets)))
+                self.assertEqual([target["id"] for target in app.targets], ["b", "c", "a"])
+                self.assertEqual([Path(target["path"]).stem for target in app.targets], ["1-1-b", "1-2-c", "1-3-a"])
+                self.assertTrue(all("thumb" not in target for target in app.targets))
+                self.assertEqual(app.selected_target, 2)
+                self.assertEqual(app.thumb_cache, {})
+                app.reload_target_list.assert_called_once()
+                app.save_current_profile.assert_called_once()
+            finally:
+                appmod.DATA_DIR, appmod.THUMBS_DIR = old_data, old_thumbs
+
+    def test_target_drop_index_uses_card_midpoints(self):
+        class Card:
+            def __init__(self, row, x, y, width=100, height=80):
+                self.row = row
+                self.x = x
+                self.y = y
+                self.width = width
+                self.height = height
+
+            def grid_info(self):
+                return {"row": self.row}
+
+            def winfo_rootx(self):
+                return self.x
+
+            def winfo_rooty(self):
+                return self.y
+
+            def winfo_width(self):
+                return self.width
+
+            def winfo_height(self):
+                return self.height
+
+        app = object.__new__(appmod.App)
+        app.targets = [object(), object(), object(), object()]
+        app.target_cards = {
+            0: (Card(0, 0, 0),),
+            1: (Card(0, 120, 0),),
+            2: (Card(0, 240, 0),),
+            3: (Card(1, 0, 100),),
+        }
+        self.assertEqual(appmod.App.target_drop_index(app, 40, 20), 0)
+        self.assertEqual(appmod.App.target_drop_index(app, 90, 20), 1)
+        self.assertEqual(appmod.App.target_drop_index(app, 220, 20), 2)
+        self.assertEqual(appmod.App.target_drop_index(app, 360, 20), 3)
+        self.assertEqual(appmod.App.target_drop_index(app, 360, 140), 4)
+
     def test_record_target_hits_updates_matching_template_counts(self):
         app = object.__new__(appmod.App)
         app.targets = [
@@ -1395,6 +1465,8 @@ class CoreTest(unittest.TestCase):
                 self.assertEqual(len(app.targets), 2)
                 self.assertTrue(Path(app.targets[0]["path"]).name.startswith("1-1-"))
                 self.assertTrue(Path(app.targets[1]["path"]).name.startswith("1-2-"))
+                self.assertTrue(all("thumb" not in target for target in app.targets))
+                self.assertFalse(any(appmod.THUMBS_DIR.glob("*.png")) if appmod.THUMBS_DIR.exists() else False)
                 root.destroy()
             finally:
                 appmod.DATA_DIR, appmod.PROFILES_DIR, appmod.STATE_PATH = old_data, old_profiles, old_state

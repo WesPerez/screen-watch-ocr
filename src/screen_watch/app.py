@@ -454,17 +454,14 @@ def ensure_target_metadata(target):
     return updated, changed
 
 
-def available_template_name(profile, count, suffix, current_path=None, current_thumb=None):
+def available_template_name(profile, count, suffix, current_path=None):
     target_dir = DATA_DIR / "templates"
     current_path = Path(current_path).resolve() if current_path else None
-    current_thumb = Path(current_thumb).resolve() if current_thumb else None
     while True:
         stem = template_name(profile, count, suffix)
         path = (target_dir / f"{stem}.png").resolve()
-        thumb = (THUMBS_DIR / f"{stem}.png").resolve()
         path_ok = not path.exists() or (current_path and path == current_path)
-        thumb_ok = not thumb.exists() or (current_thumb and thumb == current_thumb)
-        if path_ok and thumb_ok:
+        if path_ok:
             return stem
         suffix = template_stamp()
 
@@ -478,24 +475,10 @@ def save_template(image, profile, count, stamp=None):
     return path
 
 
-def save_thumb(image, path):
-    THUMBS_DIR.mkdir(parents=True, exist_ok=True)
-    thumb_path = THUMBS_DIR / Path(path).name
-    thumb = image.convert("RGB")
-    thumb.thumbnail((480, 320))
-    thumb.save(thumb_path)
-    return thumb_path
-
-
-def ensure_thumb(target):
-    thumb = target.get("thumb")
-    if thumb and Path(thumb).exists():
-        return target
-    path = Path(target["path"])
-    if path.exists():
-        target = dict(target)
-        with Image.open(path) as image:
-            target["thumb"] = str(save_thumb(image, path))
+def normalize_target_record(target):
+    target, _changed = ensure_target_metadata(target)
+    target = dict(target)
+    target.pop("thumb", None)
     return target
 
 
@@ -521,35 +504,25 @@ def rename_target(target, profile, count):
     target, metadata_changed = ensure_target_metadata(target)
     path = Path(target.get("path", ""))
     if not path.exists() or not is_under(path, DATA_DIR / "templates"):
-        return target, metadata_changed
+        updated = dict(target)
+        thumb_removed = updated.pop("thumb", None) is not None
+        return updated, metadata_changed or thumb_removed
     old_name = target.get("name")
-    thumb = Path(target.get("thumb", ""))
     old_path = path.resolve()
-    old_thumb = thumb.resolve() if thumb.exists() and is_under(thumb, THUMBS_DIR) else None
     suffix = template_suffix(path.name)
-    stem = available_template_name(profile, count, suffix, old_path, old_thumb)
+    stem = available_template_name(profile, count, suffix, old_path)
     new_path = DATA_DIR / "templates" / f"{stem}.png"
-    new_thumb = THUMBS_DIR / f"{stem}.png"
     changed = path.resolve() != new_path.resolve()
     target = dict(target)
+    thumb_removed = target.pop("thumb", None) is not None
     if changed:
         new_path.parent.mkdir(parents=True, exist_ok=True)
         path.rename(new_path)
         target["path"] = str(new_path)
     else:
         target["path"] = str(path)
-    if old_thumb:
-        if old_thumb != new_thumb.resolve():
-            new_thumb.parent.mkdir(parents=True, exist_ok=True)
-            old_thumb.rename(new_thumb)
-            changed = True
-        target["thumb"] = str(new_thumb)
-    else:
-        with Image.open(new_path) as image:
-            target["thumb"] = str(save_thumb(image, new_path))
-        changed = True
     target["name"] = stem
-    return target, changed or old_name != stem or metadata_changed
+    return target, changed or old_name != stem or metadata_changed or thumb_removed
 
 
 def normalize_target_names(targets, profile):
@@ -567,7 +540,7 @@ def normalize_profile_file(number):
     data = load_json(path, {})
     if not data:
         return False
-    targets = [ensure_thumb(t) for t in data.get("targets", []) if Path(t.get("path", "")).exists()]
+    targets = [normalize_target_record(t) for t in data.get("targets", []) if Path(t.get("path", "")).exists()]
     targets, changed = normalize_target_names(targets, number)
     if changed or len(targets) != len(data.get("targets", [])):
         data["targets"] = targets
@@ -929,6 +902,8 @@ class App:
         self.target_vars = []
         self.target_cards = {}
         self.target_last_click = (None, 0)
+        self.target_drag = None
+        self.target_drag_marker = None
         self.thumb_cache = {}
         self.selected_target = None
         self.thumb_w = 104
@@ -1438,10 +1413,9 @@ class App:
         self.prune_targets(max_templates - 1)
         self.normalize_targets()
         path = save_template(image, self.current_profile, len(self.targets) + 1)
-        thumb = save_thumb(image, path)
         with Image.open(path) as saved:
             width, height = saved.size
-        target, _changed = ensure_target_metadata({"name": path.stem, "path": str(path), "thumb": str(thumb), "size": f"{width}x{height}", "enabled": True})
+        target, _changed = ensure_target_metadata({"name": path.stem, "path": str(path), "size": f"{width}x{height}", "enabled": True})
         self.targets.append(target)
         self.selected_target = len(self.targets) - 1
         self.reload_target_list()
@@ -1464,7 +1438,7 @@ class App:
         return len(removed)
 
     def make_thumb(self, target):
-        path = target.get("thumb") or target["path"]
+        path = target["path"]
         mtime = Path(path).stat().st_mtime if Path(path).exists() else 0
         hit_count = max(0, int(target.get("hit_count", 0) or 0))
         key = (str(path), mtime, self.thumb_w, self.thumb_h, hit_count)
@@ -1516,6 +1490,109 @@ class App:
         else:
             self.target_last_click = (index, now)
         return "break"
+
+    def begin_target_drag(self, event, index):
+        self.target_drag = {"index": index, "x": event.x_root, "y": event.y_root, "active": False, "drop": index}
+        return "break"
+
+    def update_target_drag(self, event):
+        drag = getattr(self, "target_drag", None)
+        if not drag:
+            return "break"
+        if abs(event.x_root - drag["x"]) + abs(event.y_root - drag["y"]) >= 6:
+            drag["active"] = True
+        if drag["active"]:
+            drag["drop"] = self.target_drop_index(event.x_root, event.y_root)
+            self.show_target_drop_marker(drag["drop"])
+        return "break"
+
+    def end_target_drag(self, event):
+        drag = getattr(self, "target_drag", None)
+        self.clear_target_drop_marker()
+        self.target_drag = None
+        if not drag:
+            return "break"
+        if drag.get("active"):
+            self.reorder_target(drag["index"], drag.get("drop", drag["index"]))
+        else:
+            self.click_target(drag["index"])
+        return "break"
+
+    def target_drop_index(self, x_root, y_root):
+        cards = []
+        for index, widgets in getattr(self, "target_cards", {}).items():
+            card = widgets[0]
+            try:
+                row = int(card.grid_info().get("row", index // 5))
+                cards.append((row, index, card, card.winfo_rootx(), card.winfo_rooty(), card.winfo_width(), card.winfo_height()))
+            except TclError:
+                continue
+        if not cards:
+            return 0
+        rows = {}
+        for row, index, card, x, y, width, height in cards:
+            rows.setdefault(row, []).append((index, card, x, y, width, height))
+        ordered_rows = sorted(rows.items(), key=lambda item: min(card[3] for card in item[1]))
+        for _row, row_cards in ordered_rows:
+            top = min(card[3] for card in row_cards)
+            bottom = max(card[3] + card[5] for card in row_cards)
+            if y_root <= bottom:
+                for index, _card, x, _y, width, _height in sorted(row_cards, key=lambda item: item[2]):
+                    if x_root < x + width / 2:
+                        return index
+                return max(card[0] for card in row_cards) + 1
+            if y_root < top:
+                return min(card[0] for card in row_cards)
+        return len(self.targets)
+
+    def show_target_drop_marker(self, index):
+        if not getattr(self, "target_cards", None):
+            return
+        marker = getattr(self, "target_drag_marker", None)
+        if marker is None:
+            marker = Frame(self.gallery_inner, bg="#1573d1", width=3)
+            self.target_drag_marker = marker
+        anchor_index = min(index, len(self.targets) - 1)
+        widgets = self.target_cards.get(anchor_index)
+        if not widgets:
+            return
+        card = widgets[0]
+        try:
+            x = card.winfo_x() - 4
+            y = card.winfo_y()
+            if index >= len(self.targets):
+                x = card.winfo_x() + card.winfo_width() + 4
+            marker.place(x=x, y=y, width=3, height=card.winfo_height())
+            marker.lift()
+        except TclError:
+            pass
+
+    def clear_target_drop_marker(self):
+        marker = getattr(self, "target_drag_marker", None)
+        if marker is not None:
+            try:
+                marker.destroy()
+            except TclError:
+                pass
+        self.target_drag_marker = None
+
+    def reorder_target(self, from_index, insert_index):
+        if not (0 <= from_index < len(self.targets)):
+            return False
+        insert_index = max(0, min(len(self.targets), int(insert_index)))
+        if insert_index in (from_index, from_index + 1):
+            return False
+        target = self.targets.pop(from_index)
+        if from_index < insert_index:
+            insert_index -= 1
+        self.targets.insert(insert_index, target)
+        self.selected_target = insert_index
+        self.normalize_targets()
+        self.thumb_cache.clear()
+        self.reload_target_list()
+        self.save_current_profile()
+        self.status.set(f"已移动到第 {insert_index + 1} 张。")
+        return True
 
     def open_target_file(self, index):
         path = Path(self.targets[index]["path"])
@@ -1931,7 +2008,9 @@ class App:
             text.place(x=4, y=self.thumb_h + 8, width=self.thumb_w + 4, height=max(16, int(16 * self.last_scale)))
             self.target_cards[idx] = (card, image, text)
             for widget in (card, image, text):
-                widget.bind("<Button-1>", lambda _event, i=idx: self.click_target(i))
+                widget.bind("<ButtonPress-1>", lambda event, i=idx: self.begin_target_drag(event, i))
+                widget.bind("<B1-Motion>", self.update_target_drag)
+                widget.bind("<ButtonRelease-1>", self.end_target_drag)
             for widget in (card, check, image, text):
                 widget.bind("<MouseWheel>", self.scroll_targets)
         self.target_canvas.configure(height=max(150, int((self.thumb_h + 34) * 2)))
@@ -2077,7 +2156,7 @@ class App:
     def load_profile(self, number):
         self.loading_profile = True
         data = load_json(self.profile_path(number), {})
-        self.targets = [ensure_thumb(t) for t in data.get("targets", []) if Path(t.get("path", "")).exists()]
+        self.targets = [normalize_target_record(t) for t in data.get("targets", []) if Path(t.get("path", "")).exists()]
         names_changed = self.normalize_targets()
         if names_changed:
             data["targets"] = self.targets
