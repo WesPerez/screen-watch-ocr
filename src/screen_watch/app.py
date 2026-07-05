@@ -2312,7 +2312,14 @@ class App:
             self.root.focus_force()
         except TclError:
             pass
-        self.enable_source_previews(250)
+        self.after_window_shown(preview_delay=250)
+
+    def after_window_shown(self, preview_delay=500):
+        self.root.update_idletasks()
+        self.restore_layout()
+        self.root.update_idletasks()
+        self.root.after(350, self.restore_layout)
+        self.root.after(preview_delay, self.enable_source_previews)
 
     def start_instance_listener(self, sock):
         self.instance_socket = sock
@@ -2683,11 +2690,7 @@ def main(argv=None):
         return 0
     root.deiconify()
     root.lift()
-    root.update_idletasks()
-    app.restore_layout()
-    root.update_idletasks()
-    root.after(350, app.restore_layout)
-    root.after(500, app.enable_source_previews)
+    app.after_window_shown()
     app.ensure_tray_icon(show_errors=False)
     root.mainloop()
     return 0

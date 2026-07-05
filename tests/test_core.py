@@ -829,9 +829,19 @@ class CoreTest(unittest.TestCase):
         root.deiconify.assert_called_once()
         root.lift.assert_called_once()
         root.attributes.assert_not_called()
-        root.after.assert_any_call(350, app.restore_layout)
-        root.after.assert_any_call(500, app.enable_source_previews)
+        app.after_window_shown.assert_called_once_with()
         root.mainloop.assert_called_once()
+
+    def test_after_window_shown_restores_layout_and_previews(self):
+        app = object.__new__(appmod.App)
+        app.root = mock.Mock()
+        app.restore_layout = mock.Mock()
+        app.enable_source_previews = mock.Mock()
+        appmod.App.after_window_shown(app, preview_delay=250)
+        self.assertEqual(app.root.update_idletasks.call_count, 2)
+        app.restore_layout.assert_called_once_with()
+        app.root.after.assert_any_call(350, app.restore_layout)
+        app.root.after.assert_any_call(250, app.enable_source_previews)
 
     def test_main_start_minimized_stays_in_tray(self):
         root = mock.Mock()
@@ -1087,8 +1097,10 @@ class CoreTest(unittest.TestCase):
             app.root = root
             marker = object()
             app.tray_icon = marker
+            app.after_window_shown = mock.Mock()
             appmod.App.show_window(app)
             self.assertIs(app.tray_icon, marker)
+            app.after_window_shown.assert_called_once_with(preview_delay=250)
         finally:
             root.destroy()
 
